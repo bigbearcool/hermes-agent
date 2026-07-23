@@ -4321,6 +4321,66 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
         return model, runtime_kwargs
 
+    def _apply_task_model_route(
+        self,
+        message: str,
+        model: str,
+        runtime_kwargs: dict,
+        *,
+        user_config: dict,
+        platform: str,
+        session_key: str | None,
+    ) -> tuple[str, dict]:
+        """Apply a configured automatic route without overriding explicit `/model`.
+
+        The router is fail-closed: malformed policy, unknown route providers, or
+        missing credentials retain the primary model/runtime.  It intentionally
+        does not persist the automatic choice as a session override; a later
+        high-risk turn must be reconsidered independently and return to Terra.
+        """
+        if session_key and (getattr(self, "_session_model_overrides", {}) or {}).get(session_key):
+            return model, runtime_kwargs
+        try:
+            from gateway.task_model_routing import resolve_task_model_route
+
+            route = resolve_task_model_route(message, user_config, platform=platform)
+        except Exception:
+            logger.debug("Task model route resolution failed; retaining primary model", exc_info=True)
+            return model, runtime_kwargs
+        if route is None:
+            return model, runtime_kwargs
+
+        try:
+            routed_runtime = _resolve_runtime_agent_kwargs_for_provider(route.provider)
+        except Exception:
+            logger.warning(
+                "Task model route ignored: route=%s provider=%s could not resolve runtime",
+                route.name,
+                route.provider,
+                exc_info=True,
+            )
+            return model, runtime_kwargs
+        # MoA is a virtual provider which owns its constituent credentials, so
+        # it legitimately has no standalone API key.  Every ordinary provider
+        # must have an authenticated runtime before we switch to it.
+        if route.provider != "moa" and not routed_runtime.get("api_key"):
+            logger.warning(
+                "Task model route ignored: route=%s provider=%s has no credentials",
+                route.name,
+                route.provider,
+            )
+            return model, runtime_kwargs
+
+        logger.info(
+            "Task model route selected: route=%s model=%s provider=%s reason=%s session=%s",
+            route.name,
+            route.model,
+            route.provider,
+            route.reason,
+            session_key or "",
+        )
+        return route.model, routed_runtime
+
     def _resolve_turn_agent_config(self, user_message: str, model: str, runtime_kwargs: dict) -> dict:
         """Build the effective model/runtime config for a single turn.
 
@@ -20453,6 +20513,14 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 logger.debug(
                     "run_agent resolved: model=%s provider=%s session=%s",
                     model, runtime_kwargs.get("provider"), session_key or "",
+                )
+                model, runtime_kwargs = self._apply_task_model_route(
+                    message,
+                    model,
+                    runtime_kwargs,
+                    user_config=user_config,
+                    platform=source.platform.value,
+                    session_key=session_key,
                 )
             except Exception as exc:
                 return {
