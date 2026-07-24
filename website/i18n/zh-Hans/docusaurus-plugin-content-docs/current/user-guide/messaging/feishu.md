@@ -431,6 +431,28 @@ platforms:
 | 重连间隔 | `ws_reconnect_interval` | 120s | 两次重连尝试之间的等待时间 |
 | Ping 间隔 | `ws_ping_interval` | _（SDK 默认）_ | WebSocket 保活 ping 的频率 |
 
+## 流式回复卡片
+
+飞书可以把 Hermes 的流式回复持续更新在同一张卡片中，避免拆成多条文本消息。在
+`config.yaml` 中配置渲染模式：
+
+```yaml
+platforms:
+  feishu:
+    extra:
+      streaming_mode: cardkit
+```
+
+| 模式 | 行为 |
+|------|------|
+| _未设置_ | 保持现有 text/post 流式行为 |
+| `card` | 使用飞书 IM API 持续更新一张旧版交互卡片 |
+| `cardkit` | 使用 CardKit v2，将 commentary、工具状态和最终答案保留在同一张卡片 |
+
+`cardkit` 要求飞书应用具备 CardKit 创建、更新、设置及流式内容权限。如果 CardKit
+不可用或更新失败，Hermes 会关闭未完成的 CardKit 卡片，并降级到旧版交互卡片。
+这是行为配置，应写入 `config.yaml`，不要写入 `.env`。
+
 ## 按群访问控制
 
 除全局 `FEISHU_GROUP_POLICY` 外，还可在 config.yaml 的 `group_rules` 中为每个群聊设置细粒度规则：

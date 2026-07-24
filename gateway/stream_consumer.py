@@ -51,6 +51,10 @@ _NEW_SEGMENT = object()
 # API/tool iterations (for example: "I'll inspect the repo first.").
 _COMMENTARY = object()
 
+# Queue marker for structured tool lifecycle status rendered by adapters that
+# keep progress and prose inside one streaming message/card.
+_STATUS = object()
+
 # Queue marker for a synchronous flush barrier.  Enqueued as
 # ``(_FLUSH, threading.Event)``; the drain loop finalizes and delivers any
 # buffered segment, then sets the event.  A caller on the agent worker thread
@@ -141,6 +145,9 @@ class GatewayStreamConsumer:
         self.chat_id = chat_id
         self.cfg = config or StreamConsumerConfig()
         self.metadata = metadata
+        self._streaming_metadata = dict(metadata or {})
+        self._streaming_metadata["__hermes_streaming"] = True
+        self._stream_started_at = time.monotonic()
         # Fired whenever a fresh content bubble is created on the platform
         # (first-send of a new message, commentary, overflow chunk, or
         # fallback continuation). The gateway uses this to linearize the
@@ -232,6 +239,17 @@ class GatewayStreamConsumer:
         # through the normal first-send path so the user gets a real message
         # in their chat history (drafts have no message_id).
         self._use_draft_streaming = False
+        self._single_streaming_message = self._resolve_single_streaming_message()
+        self._unified_status_enabled = self._resolve_unified_stream_status()
+        if not self._single_streaming_message and not self._unified_status_enabled:
+            self._streaming_metadata.pop("__hermes_streaming", None)
+        self._tool_status_running: dict[str, str] = {}
+        self._tool_status_done: list[str] = []
+        self._tool_call_serial = 0
+        self._tool_round = 0
+        self._tool_records: list[dict[str, Any]] = []
+        self._tool_records_by_id: dict[str, dict[str, Any]] = {}
+        self._tool_pending_by_name: dict[str, list[str]] = {}
         self._draft_id: Optional[int] = None
         # Cumulative draft-frame failure count for this consumer.  After the
         # first failure we permanently disable drafts for the remainder of
@@ -256,14 +274,167 @@ class GatewayStreamConsumer:
         legacy send path, while fresh/fallback final sends can still use richer
         final-message delivery.
         """
-        meta = dict(self.metadata) if self.metadata else {}
+        meta = dict(self._streaming_metadata)
         if self._initial_reply_to_id:
             meta["reply_to_message_id"] = self._initial_reply_to_id
         if expect_edits:
             meta["expect_edits"] = True
         if final:
             meta["notify"] = True
+            meta["__hermes_stream_elapsed_seconds"] = max(
+                0.0,
+                time.monotonic() - self._stream_started_at,
+            )
         return meta or None
+
+    def _resolve_single_streaming_message(self) -> bool:
+        """Whether the adapter owns overflow handling inside one message."""
+        if not isinstance(self.adapter, _BasePlatformAdapter):
+            return False
+        probe = getattr(self.adapter, "supports_single_streaming_message", None)
+        if not callable(probe):
+            return False
+        try:
+            return probe(self._streaming_metadata) is True
+        except TypeError:
+            try:
+                return probe() is True
+            except Exception:
+                return False
+        except Exception:
+            return False
+
+    def _resolve_unified_stream_status(self) -> bool:
+        """Whether tool status and commentary stay in the active message."""
+        if not isinstance(self.adapter, _BasePlatformAdapter):
+            return False
+        probe = getattr(self.adapter, "supports_unified_stream_status", None)
+        if not callable(probe):
+            return False
+        try:
+            return probe(self._streaming_metadata) is True
+        except TypeError:
+            try:
+                return probe() is True
+            except Exception:
+                return False
+        except Exception:
+            return False
+
+    @property
+    def unified_status_enabled(self) -> bool:
+        return self._unified_status_enabled
+
+    def on_status(self, event: dict) -> bool:
+        """Queue a structured tool event for unified-card rendering."""
+        if not self._unified_status_enabled or not isinstance(event, dict):
+            return False
+        kind = str(event.get("event_type") or event.get("event") or "")
+        if kind not in {"tool.started", "tool.completed", "tool.failed"}:
+            return False
+        if str(event.get("tool_name") or event.get("name") or "") == "_thinking":
+            return False
+        self._queue.put((_STATUS, event))
+        return True
+
+    def _apply_status_event(self, event: dict) -> None:
+        kind = str(event.get("event_type") or event.get("event") or "")
+        tool_name = str(event.get("tool_name") or event.get("name") or "tool")
+        if kind == "tool.started":
+            if not self._tool_status_running:
+                self._tool_round += 1
+            self._tool_call_serial += 1
+            explicit_id = str(
+                event.get("call_id") or event.get("tool_call_id") or ""
+            ).strip()
+            key = explicit_id or f"tool_call_{self._tool_call_serial}"
+            while key in self._tool_records_by_id:
+                self._tool_call_serial += 1
+                key = f"tool_call_{self._tool_call_serial}"
+            preview = str(event.get("preview") or "").strip()
+            record: dict[str, Any] = {
+                "id": key,
+                "round": max(1, self._tool_round),
+                "name": tool_name,
+                "status": "running",
+            }
+            if preview:
+                record["preview"] = preview[:160]
+            self._tool_records.append(record)
+            self._tool_records_by_id[key] = record
+            self._tool_pending_by_name.setdefault(tool_name, []).append(key)
+            self._tool_status_running[key] = (
+                f"⏳ Tool running: `{tool_name}`"
+            )
+        elif kind in {"tool.completed", "tool.failed"}:
+            explicit_id = str(
+                event.get("call_id") or event.get("tool_call_id") or ""
+            ).strip()
+            key = (
+                explicit_id
+                if explicit_id in self._tool_records_by_id
+                else ""
+            )
+            pending = self._tool_pending_by_name.get(tool_name, [])
+            if not key:
+                while pending:
+                    candidate = pending.pop(0)
+                    if candidate in self._tool_status_running:
+                        key = candidate
+                        break
+            elif key in pending:
+                pending.remove(key)
+            if not key:
+                self._tool_call_serial += 1
+                key = f"tool_call_{self._tool_call_serial}"
+                if not self._tool_round:
+                    self._tool_round = 1
+                record = {
+                    "id": key,
+                    "round": self._tool_round,
+                    "name": tool_name,
+                    "status": "running",
+                }
+                self._tool_records.append(record)
+                self._tool_records_by_id[key] = record
+            self._tool_status_running.pop(key, None)
+            failed = kind == "tool.failed" or bool(
+                event.get("is_error") or event.get("failed")
+            )
+            icon = "❌" if failed else "✅"
+            label = "Tool failed" if failed else "Tool done"
+            duration: Optional[float] = None
+            try:
+                if event.get("duration") is not None:
+                    duration = max(0.0, float(event["duration"]))
+            except (TypeError, ValueError):
+                pass
+            duration_text = (
+                f" ({duration:.1f}s)" if duration is not None else ""
+            )
+            self._tool_status_done.append(
+                f"{icon} {label}: `{tool_name}`{duration_text}"
+            )
+            record = self._tool_records_by_id[key]
+            record["status"] = "failed" if failed else "done"
+            if duration is not None:
+                record["duration"] = duration
+            self._tool_records = self._tool_records[-100:]
+            live_ids = {str(item["id"]) for item in self._tool_records}
+            self._tool_records_by_id = {
+                record_id: item
+                for record_id, item in self._tool_records_by_id.items()
+                if record_id in live_ids
+            }
+            self._tool_status_done = self._tool_status_done[-100:]
+
+    def _refresh_status_metadata(self) -> None:
+        if self._unified_status_enabled:
+            self._streaming_metadata["__hermes_stream_status"] = {
+                "running": list(self._tool_status_running.values()),
+                "done": list(self._tool_status_done),
+                "calls": [dict(item) for item in self._tool_records],
+            }
 
     @property
     def already_sent(self) -> bool:
@@ -317,14 +488,14 @@ class GatewayStreamConsumer:
         # must accept finalize= even when it is False (guarded by tests).
         kwargs["finalize"] = finalize
 
-        if self.metadata:
+        if self._streaming_metadata:
             try:
                 params = inspect.signature(self.adapter.edit_message).parameters
                 if "metadata" in params or any(
                     param.kind is inspect.Parameter.VAR_KEYWORD
                     for param in params.values()
                 ):
-                    kwargs["metadata"] = self.metadata
+                    kwargs["metadata"] = self._metadata_for_send(final=finalize)
             except (TypeError, ValueError):
                 pass
         return await self.adapter.edit_message(**kwargs)
@@ -344,6 +515,8 @@ class GatewayStreamConsumer:
 
     def on_segment_break(self) -> None:
         """Finalize the current stream segment and start a fresh message."""
+        if self._unified_status_enabled:
+            return
         self._queue.put(_NEW_SEGMENT)
 
     def on_commentary(self, text: str) -> None:
@@ -650,8 +823,10 @@ class GatewayStreamConsumer:
                 got_done = False
                 got_segment_break = False
                 got_flush = False
+                got_status_update = False
                 flush_event = None
                 commentary_text = None
+                unified_commentary_text = None
                 while True:
                     try:
                         item = self._queue.get_nowait()
@@ -663,6 +838,19 @@ class GatewayStreamConsumer:
                             break
                         if isinstance(item, tuple) and len(item) == 2 and item[0] is _COMMENTARY:
                             commentary_text = item[1]
+                            if self._unified_status_enabled:
+                                cleaned = self._clean_for_display(commentary_text)
+                                if cleaned.strip():
+                                    if self._accumulated and not self._accumulated.endswith("\n"):
+                                        self._accumulated += "\n\n"
+                                    self._accumulated += cleaned.rstrip() + "\n\n"
+                                    unified_commentary_text = cleaned
+                                commentary_text = None
+                            break
+                        if isinstance(item, tuple) and len(item) == 2 and item[0] is _STATUS:
+                            self._apply_status_event(item[1])
+                            self._refresh_status_metadata()
+                            got_status_update = True
                             break
                         if isinstance(item, tuple) and len(item) == 2 and item[0] is _FLUSH:
                             # Flush barrier: finalize the current segment like a
@@ -704,6 +892,8 @@ class GatewayStreamConsumer:
                 should_edit = (
                     got_done
                     or got_segment_break
+                    or got_status_update
+                    or unified_commentary_text is not None
                     or commentary_text is not None
                 )
                 if not self.cfg.buffer_only:
@@ -730,17 +920,24 @@ class GatewayStreamConsumer:
                     should_edit
                     and not got_done
                     and not got_segment_break
+                    and not got_status_update
+                    and unified_commentary_text is None
                     and commentary_text is None
                     and _is_partial_silence_marker(
                         self._clean_for_display(self._accumulated)
                     )
                 ):
                     should_edit = False
-                if should_edit and self._accumulated:
+                has_unified_status = bool(
+                    self._unified_status_enabled
+                    and (self._tool_status_running or self._tool_status_done)
+                )
+                if should_edit and (self._accumulated or has_unified_status):
                     # Split overflow: if accumulated text exceeds the platform
                     # limit, split into properly sized chunks.
                     if (
-                        _len_fn(self._accumulated) > _safe_limit
+                        not self._single_streaming_message
+                        and _len_fn(self._accumulated) > _safe_limit
                         and self._message_id is None
                     ):
                         # No existing message to edit (first message or after a
@@ -789,7 +986,8 @@ class GatewayStreamConsumer:
                     # Existing message: edit it with the first chunk, then
                     # start a new message for the overflow remainder.
                     while (
-                        _len_fn(self._accumulated) > _safe_limit
+                        not self._single_streaming_message
+                        and _len_fn(self._accumulated) > _safe_limit
                         and self._message_id is not None
                         and self._edit_supported
                     ):
@@ -825,7 +1023,11 @@ class GatewayStreamConsumer:
                         self._last_sent_text = ""
 
                     display_text = self._accumulated
-                    if not got_done and not got_segment_break and commentary_text is None:
+                    if (
+                        not got_done
+                        and not got_segment_break
+                        and commentary_text is None
+                    ):
                         display_text += self.cfg.cursor
 
                     # Segment break: finalize the current message so platforms
@@ -837,11 +1039,16 @@ class GatewayStreamConsumer:
                     current_update_visible = await self._send_or_edit(
                         display_text,
                         finalize=(got_done or got_segment_break),
+                        force_update=got_status_update,
                         # A segment-break finalize closes a preamble, not the
                         # turn-final answer — only got_done marks delivered (#29346).
                         is_turn_final=got_done,
                     )
                     self._last_edit_time = time.monotonic()
+                    if current_update_visible and unified_commentary_text:
+                        self._delivered_commentary_texts.append(
+                            unified_commentary_text
+                        )
 
                 if got_done:
                     if self._accumulated or self._message_id is not None or self._already_sent:
@@ -1178,7 +1385,11 @@ class GatewayStreamConsumer:
             else len
         )
         safe_limit = max(500, raw_limit - 100)
-        chunks = self._split_text_chunks(continuation, safe_limit, len_fn=_len_fn)
+        chunks = (
+            [continuation]
+            if self._single_streaming_message
+            else self._split_text_chunks(continuation, safe_limit, len_fn=_len_fn)
+        )
 
         stale_message_id = self._message_id  # partial message to clean up
         last_message_id: Optional[str] = None
@@ -1397,7 +1608,7 @@ class GatewayStreamConsumer:
         try:
             supported = self.adapter.supports_draft_streaming(
                 chat_type=self.cfg.chat_type or None,
-                metadata=self.metadata,
+                metadata=self._metadata_for_send(),
             )
         except Exception:
             logger.debug("supports_draft_streaming probe raised", exc_info=True)
@@ -1431,7 +1642,7 @@ class GatewayStreamConsumer:
                 chat_id=self.chat_id,
                 draft_id=self._draft_id,
                 content=text,
-                metadata=self.metadata,
+                metadata=self._metadata_for_send(),
             )
         except Exception as e:
             logger.debug(
@@ -1478,7 +1689,7 @@ class GatewayStreamConsumer:
             result = await self.adapter.send(
                 chat_id=self.chat_id,
                 content=tail,
-                metadata=self.metadata,
+                metadata=self._metadata_for_send(),
             )
             if result.success:
                 self._already_sent = True
@@ -1515,7 +1726,7 @@ class GatewayStreamConsumer:
             result = await self.adapter.send(
                 chat_id=self.chat_id,
                 content=text,
-                metadata=self.metadata,
+                metadata=self._metadata_for_send(),
             )
             # Note: do NOT set _already_sent = True here.
             # Commentary messages are interim status updates (e.g. "Using browser
@@ -1617,7 +1828,7 @@ class GatewayStreamConsumer:
             return False
         try:
             try:
-                result = fn(text, metadata=self.metadata)
+                result = fn(text, metadata=self._metadata_for_send())
             except TypeError:
                 # Adapter / test double whose hook doesn't accept the metadata
                 # keyword — fall back to the positional-only form.
@@ -1743,7 +1954,12 @@ class GatewayStreamConsumer:
         )
 
     async def _send_or_edit(
-        self, text: str, *, finalize: bool = False, is_turn_final: bool = True,
+        self,
+        text: str,
+        *,
+        finalize: bool = False,
+        is_turn_final: bool = True,
+        force_update: bool = False,
     ) -> bool:
         """Send or edit the streaming message.
 
@@ -1764,9 +1980,13 @@ class GatewayStreamConsumer:
         if self.cfg.cursor:
             visible_without_cursor = visible_without_cursor.replace(self.cfg.cursor, "")
         _visible_stripped = visible_without_cursor.strip()
-        if not _visible_stripped:
+        has_unified_status = bool(
+            self._unified_status_enabled
+            and (self._tool_status_running or self._tool_status_done)
+        )
+        if not _visible_stripped and not has_unified_status:
             return True  # cursor-only / whitespace-only update
-        if not text.strip():
+        if not text.strip() and not has_unified_status:
             return True  # nothing to send is "success"
         # Guard: do not create a brand-new standalone message when the only
         # visible content is a handful of characters alongside the streaming
@@ -1781,7 +2001,8 @@ class GatewayStreamConsumer:
         if (self._message_id is None
                 and self.cfg.cursor
                 and self.cfg.cursor in text
-                and len(_visible_stripped) < _MIN_NEW_MSG_CHARS):
+                and len(_visible_stripped) < _MIN_NEW_MSG_CHARS
+                and not has_unified_status):
             return True  # too short for a standalone message — accumulate more
 
         # Native draft streaming: route mid-stream frames through send_draft.
@@ -1822,7 +2043,7 @@ class GatewayStreamConsumer:
                     # finalize=True edit even when content is unchanged, so
                     # their streaming UI can transition out of the in-
                     # progress state.  Everyone else short-circuits.
-                    if text == self._last_sent_text and not (
+                    if text == self._last_sent_text and not force_update and not (
                         finalize and self._adapter_requires_finalize
                     ):
                         return True

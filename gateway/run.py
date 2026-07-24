@@ -19869,6 +19869,38 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         _live_status_adapter.set_status_text(source.chat_id, None)
                 except Exception as _ls_err:
                     logger.debug("live status update failed: %s", _ls_err)
+
+            # Unified streaming adapters (currently Feishu CardKit) render
+            # tool lifecycle status inside the active content card. Dispatch
+            # before the legacy progress-queue gates so tool.started and
+            # tool.completed remain available even when separate progress
+            # bubbles are disabled.
+            _unified_status_accepted = False
+            try:
+                _stream_consumer = (
+                    stream_consumer_holder[0]
+                    if stream_consumer_holder
+                    else None
+                )
+                _on_status = getattr(_stream_consumer, "on_status", None)
+                if callable(_on_status):
+                    _unified_status_accepted = bool(
+                        _on_status(
+                            {
+                                "event_type": event_type,
+                                "tool_name": tool_name,
+                                "preview": preview,
+                                "args": args or {},
+                                **kwargs,
+                            }
+                        )
+                    )
+            except Exception as _status_err:
+                logger.debug(
+                    "unified stream status dispatch failed: %s",
+                    _status_err,
+                )
+
             # "log" mode: append tool.started lines to the log queue and stay
             # silent in chat. Handled before the progress_queue guard because
             # log mode runs without a chat progress queue.
@@ -19879,6 +19911,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     log_queue.put(f"{ts}  {tool_name}:{preview_str}".rstrip())
                 if not progress_queue:
                     return
+            if _unified_status_accepted:
+                return
             if not progress_queue or not _run_still_current():
                 return
 
@@ -20751,11 +20785,16 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                             transport=_scfg.transport or "edit",
                             chat_type=getattr(source, "chat_type", "") or "",
                         )
+                        _consumer_metadata = dict(
+                            _status_thread_metadata or {}
+                        )
+                        if model:
+                            _consumer_metadata["__hermes_stream_model"] = model
                         _stream_consumer = GatewayStreamConsumer(
                             adapter=_adapter,
                             chat_id=source.chat_id,
                             config=_consumer_cfg,
-                            metadata=_status_thread_metadata,
+                            metadata=_consumer_metadata,
                             on_new_message=(
                                 (lambda: progress_queue.put(("__reset__",)))
                                 if progress_queue is not None

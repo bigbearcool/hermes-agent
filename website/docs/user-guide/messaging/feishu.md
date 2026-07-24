@@ -488,6 +488,30 @@ platforms:
 | Reconnect interval | `ws_reconnect_interval` | 120s | How long to wait between reconnection attempts |
 | Ping interval | `ws_ping_interval` | _(SDK default)_ | Frequency of WebSocket keepalive pings |
 
+## Streaming Reply Cards
+
+Feishu can keep a streamed Hermes reply in one editable card instead of
+creating multiple text messages. Configure the renderer in `config.yaml`:
+
+```yaml
+platforms:
+  feishu:
+    extra:
+      streaming_mode: cardkit
+```
+
+| Mode | Behavior |
+|------|----------|
+| _(unset)_ | Existing text/post streaming behavior |
+| `card` | One legacy interactive card, updated through the IM API |
+| `cardkit` | CardKit v2 streaming card with commentary, tool status, and the final answer in one card |
+
+`cardkit` requires the Feishu application to have CardKit create, update,
+settings, and streaming-content permissions. If CardKit is unavailable or an
+update fails, Hermes closes the incomplete CardKit card and falls back to a
+legacy interactive card. This is a behavioral setting; keep it in
+`config.yaml`, not `.env`.
+
 ## Per-Group Access Control
 
 Beyond the global `FEISHU_GROUP_POLICY`, you can set fine-grained rules per group chat using `group_rules` in config.yaml:

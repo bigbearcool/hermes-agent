@@ -10,7 +10,7 @@ from collections import OrderedDict
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Dict
-from unittest.mock import AsyncMock, Mock, patch
+from unittest.mock import AsyncMock, MagicMock, Mock, patch
 
 from gateway.platforms.base import ProcessingOutcome
 
@@ -524,6 +524,443 @@ class TestFeishuAdapterMessaging(unittest.TestCase):
             captured["request"].request_body.content,
             json.dumps({"text": "📖 read_file: \"/tmp/image.png\""}, ensure_ascii=False),
         )
+
+    def test_cardkit_stream_send_wraps_message_id_and_streams_initial_content(self):
+        from gateway.config import PlatformConfig
+        from plugins.platforms.feishu.adapter import FeishuAdapter
+
+        adapter = FeishuAdapter(
+            PlatformConfig(extra={"streaming_mode": "cardkit"})
+        )
+        adapter._client = SimpleNamespace(cardkit=SimpleNamespace())
+        response = SimpleNamespace(
+            success=lambda: True,
+            data=SimpleNamespace(message_id="om_123"),
+        )
+        adapter._create_cardkit_card = AsyncMock(return_value="card_123")
+        adapter._stream_cardkit_content = AsyncMock()
+        adapter._feishu_send_with_retry = AsyncMock(return_value=response)
+
+        result = asyncio.run(
+            adapter.send(
+                chat_id="oc_chat",
+                content="正在分析",
+                metadata={"__hermes_streaming": True},
+            )
+        )
+
+        self.assertTrue(result.success)
+        self.assertEqual(result.message_id, "cardkit:card_123:om_123")
+        adapter._stream_cardkit_content.assert_awaited_once_with(
+            "card_123",
+            "正在分析",
+        )
+        send_kwargs = adapter._feishu_send_with_retry.await_args.kwargs
+        self.assertEqual(send_kwargs["msg_type"], "interactive")
+        self.assertEqual(
+            json.loads(send_kwargs["payload"]),
+            {"type": "card", "data": {"card_id": "card_123"}},
+        )
+
+    def test_cardkit_cards_expose_clear_streaming_and_final_states(self):
+        from plugins.platforms.feishu.adapter import FeishuAdapter
+
+        initial = FeishuAdapter._build_cardkit_initial_card()
+        self.assertNotIn("header", initial)
+        self.assertEqual(initial["config"]["summary"]["content"], "思考中...")
+        self.assertEqual(
+            initial["body"]["elements"][0]["content"],
+            "",
+        )
+        self.assertEqual(
+            initial["body"]["elements"][1]["element_id"],
+            "loading_icon",
+        )
+        self.assertEqual(
+            initial["body"]["elements"][1]["icon"]["img_key"],
+            FeishuAdapter._CARDKIT_LOADING_ICON_KEY,
+        )
+
+        streaming = FeishuAdapter._compose_unified_stream_content(
+            "正在整理结果",
+            {
+                "__hermes_stream_status": {
+                    "running": ["⏳ Tool running: `web_search`"],
+                    "done": ["✅ Tool done: `read_file`"],
+                    "calls": [
+                        {
+                            "id": "call_1",
+                            "round": 1,
+                            "name": "read_file",
+                            "status": "done",
+                            "duration": 0.2,
+                        },
+                        {
+                            "id": "call_2",
+                            "round": 2,
+                            "name": "web_search",
+                            "status": "running",
+                        },
+                    ],
+                }
+            },
+        )
+        self.assertNotIn("**执行进度**", streaming)
+        self.assertNotIn("**回复内容**", streaming)
+        self.assertIn("**工具调用 · 第 1 轮**", streaming)
+        self.assertIn("✅ `read_file` · 0.2s", streaming)
+        self.assertIn("**工具调用 · 第 2 轮**", streaming)
+        self.assertIn("⏳ `web_search`", streaming)
+        self.assertIn("正在整理结果", streaming)
+
+        final = FeishuAdapter._build_final_cardkit_card(
+            "最终答案",
+            tool_status={
+                "running": [],
+                "done": ["✅ Tool done: `read_file`"],
+                "calls": [
+                    {
+                        "id": "call_1",
+                        "round": 1,
+                        "name": "read_file",
+                        "status": "done",
+                        "duration": 0.2,
+                    }
+                ],
+            },
+            elapsed_seconds=1.25,
+            model_name="test-model",
+        )
+        self.assertNotIn("header", final)
+        self.assertNotIn("summary", final["config"])
+        self.assertEqual(final["body"]["elements"][0]["content"], "最终答案")
+        tool_trace = final["body"]["elements"][1]
+        self.assertEqual(tool_trace["tag"], "collapsible_panel")
+        self.assertFalse(tool_trace["expanded"])
+        self.assertIn(
+            "工具调用记录（1）",
+            tool_trace["header"]["title"]["content"],
+        )
+        self.assertIn("**第 1 轮**", tool_trace["elements"][0]["content"])
+        self.assertIn(
+            "✅ `read_file` · 0.2s",
+            tool_trace["elements"][0]["content"],
+        )
+        self.assertEqual(final["body"]["elements"][-2]["tag"], "hr")
+        footer = final["body"]["elements"][-1]
+        self.assertEqual(footer["text_size"], "notation")
+        self.assertIn("🤖 test-model", footer["content"])
+        self.assertIn("⏱ 1.2s", footer["content"])
+        self.assertIn("🔧 1 tools", footer["content"])
+        terminal = FeishuAdapter._build_cardkit_terminal_notice("已降级")
+
+        def _element_ids(value):
+            if isinstance(value, dict):
+                if value.get("element_id"):
+                    yield value["element_id"]
+                for child in value.values():
+                    yield from _element_ids(child)
+            elif isinstance(value, list):
+                for child in value:
+                    yield from _element_ids(child)
+
+        element_ids = [
+            *_element_ids(initial),
+            *_element_ids(final),
+            *_element_ids(terminal),
+        ]
+        self.assertTrue(element_ids)
+        self.assertTrue(
+            all(
+                len(element_id) <= 20
+                and element_id[0].isalpha()
+                and element_id.replace("_", "").isalnum()
+                for element_id in element_ids
+            )
+        )
+
+    def test_cardkit_initial_stream_failure_replaces_reference_message_in_place(self):
+        from gateway.config import PlatformConfig
+        from plugins.platforms.feishu.adapter import FeishuAdapter
+
+        adapter = FeishuAdapter(
+            PlatformConfig(extra={"streaming_mode": "cardkit"})
+        )
+        update_method = object()
+        adapter._client = SimpleNamespace(
+            cardkit=SimpleNamespace(),
+            im=SimpleNamespace(
+                v1=SimpleNamespace(
+                    message=SimpleNamespace(update=update_method),
+                )
+            ),
+        )
+        response = SimpleNamespace(
+            success=lambda: True,
+            data=SimpleNamespace(message_id="om_123"),
+        )
+        adapter._create_cardkit_card = AsyncMock(return_value="card_123")
+        adapter._stream_cardkit_content = AsyncMock(
+            side_effect=RuntimeError("content rejected")
+        )
+        adapter._close_cardkit_card_before_fallback = AsyncMock()
+        adapter._feishu_send_with_retry = AsyncMock(return_value=response)
+        adapter._build_update_message_body = MagicMock(return_value="body")
+        adapter._build_update_message_request = MagicMock(
+            return_value=SimpleNamespace(message_id="om_123")
+        )
+        adapter._run_blocking = AsyncMock(return_value=response)
+
+        result = asyncio.run(
+            adapter.send(
+                chat_id="oc_chat",
+                content="兼容结果",
+                metadata={"__hermes_streaming": True},
+            )
+        )
+
+        self.assertTrue(result.success)
+        self.assertEqual(result.message_id, "om_123")
+        adapter._feishu_send_with_retry.assert_awaited_once()
+        adapter._close_cardkit_card_before_fallback.assert_awaited_once()
+        adapter._run_blocking.assert_awaited_once()
+        adapter._build_update_message_request.assert_called_once_with(
+            message_id="om_123",
+            request_body="body",
+        )
+
+    @unittest.skipUnless(_HAS_LARK_OAPI, "lark-oapi is required for CardKit tests")
+    def test_cardkit_sdk_request_builders_cover_full_lifecycle(self):
+        from gateway.config import PlatformConfig
+        from plugins.platforms.feishu.adapter import FeishuAdapter
+
+        captured = {}
+
+        class _CardAPI:
+            def create(self, request):
+                captured["create"] = request
+                return SimpleNamespace(
+                    success=lambda: True,
+                    data=SimpleNamespace(card_id="card_123"),
+                )
+
+            def settings(self, request):
+                captured["settings"] = request
+                return SimpleNamespace(success=lambda: True)
+
+            def update(self, request):
+                captured["update"] = request
+                return SimpleNamespace(success=lambda: True)
+
+        class _CardElementAPI:
+            def content(self, request):
+                captured["content"] = request
+                return SimpleNamespace(success=lambda: True)
+
+        adapter = FeishuAdapter(
+            PlatformConfig(extra={"streaming_mode": "cardkit"})
+        )
+        adapter._client = SimpleNamespace(
+            cardkit=SimpleNamespace(
+                v1=SimpleNamespace(
+                    card=_CardAPI(),
+                    card_element=_CardElementAPI(),
+                )
+            )
+        )
+
+        async def _exercise():
+            card_id = await adapter._create_cardkit_card(
+                adapter._build_cardkit_initial_card()
+            )
+            await adapter._stream_cardkit_content(card_id, "流式内容")
+            await adapter._set_cardkit_streaming_mode(card_id, 0)
+            await adapter._update_cardkit_card(
+                card_id,
+                adapter._build_final_cardkit_card("最终内容"),
+            )
+            return card_id
+
+        card_id = asyncio.run(_exercise())
+
+        self.assertEqual(card_id, "card_123")
+        self.assertEqual(captured["content"].card_id, "card_123")
+        self.assertEqual(captured["content"].element_id, "streaming_content")
+        self.assertEqual(captured["content"].request_body.sequence, 2)
+        self.assertEqual(captured["settings"].card_id, "card_123")
+        self.assertEqual(captured["settings"].request_body.sequence, 3)
+        self.assertEqual(captured["update"].card_id, "card_123")
+        self.assertEqual(captured["update"].request_body.sequence, 4)
+        self.assertEqual(adapter._cardkit_sequences["card_123"], 4)
+
+    def test_cardkit_finalize_updates_card_and_releases_per_card_state(self):
+        from gateway.config import PlatformConfig
+        from plugins.platforms.feishu.adapter import FeishuAdapter
+
+        adapter = FeishuAdapter(
+            PlatformConfig(extra={"streaming_mode": "cardkit"})
+        )
+        adapter._client = SimpleNamespace(cardkit=SimpleNamespace())
+        adapter._set_cardkit_streaming_mode = AsyncMock()
+        adapter._update_cardkit_card = AsyncMock()
+        adapter._cardkit_sequences["card_123"] = 4
+        adapter._cardkit_locks["card_123"] = asyncio.Lock()
+
+        result = asyncio.run(
+            adapter.edit_message(
+                chat_id="oc_chat",
+                message_id="cardkit:card_123:om_123",
+                content="最终答案",
+                finalize=True,
+                metadata={
+                    "__hermes_streaming": True,
+                    "__hermes_stream_status": {
+                        "running": [],
+                        "done": ["✅ read_file (0.2s)"],
+                    },
+                },
+            )
+        )
+
+        self.assertTrue(result.success)
+        adapter._set_cardkit_streaming_mode.assert_awaited_once_with(
+            "card_123",
+            0,
+        )
+        final_card = adapter._update_cardkit_card.await_args.args[1]
+        final_payload = json.dumps(final_card, ensure_ascii=False)
+        self.assertIn("最终答案", final_payload)
+        self.assertIn("✅ read_file (0.2s)", final_payload)
+        self.assertIn("工具调用记录（1）", final_payload)
+        self.assertIn("🔧 1 tools", final_payload)
+        self.assertNotIn("card_123", adapter._cardkit_sequences)
+        self.assertNotIn("card_123", adapter._cardkit_locks)
+
+    def test_cardkit_failure_closes_orphan_and_falls_back_to_interactive_card(self):
+        from gateway.config import PlatformConfig
+        from plugins.platforms.feishu.adapter import FeishuAdapter
+
+        adapter = FeishuAdapter(
+            PlatformConfig(extra={"streaming_mode": "cardkit"})
+        )
+        adapter._client = SimpleNamespace(cardkit=SimpleNamespace())
+        adapter._create_cardkit_card = AsyncMock(return_value="card_123")
+        adapter._feishu_send_with_retry = AsyncMock(
+            side_effect=[
+                RuntimeError("card reference rejected"),
+                SimpleNamespace(
+                    success=lambda: True,
+                    data=SimpleNamespace(message_id="om_fallback"),
+                ),
+            ]
+        )
+        adapter._close_cardkit_card_before_fallback = AsyncMock()
+
+        result = asyncio.run(
+            adapter.send(
+                chat_id="oc_chat",
+                content="兼容结果",
+                metadata={"__hermes_streaming": True},
+            )
+        )
+
+        self.assertTrue(result.success)
+        self.assertEqual(result.message_id, "om_fallback")
+        adapter._close_cardkit_card_before_fallback.assert_awaited_once()
+        fallback_kwargs = adapter._feishu_send_with_retry.await_args_list[-1].kwargs
+        self.assertEqual(fallback_kwargs["msg_type"], "interactive")
+        self.assertIn("兼容结果", fallback_kwargs["payload"])
+
+    def test_cardkit_fallback_releases_per_card_state(self):
+        from gateway.config import PlatformConfig
+        from plugins.platforms.feishu.adapter import FeishuAdapter
+
+        adapter = FeishuAdapter(
+            PlatformConfig(extra={"streaming_mode": "cardkit"})
+        )
+        adapter._cardkit_sequences["card_123"] = 2
+        adapter._cardkit_locks["card_123"] = asyncio.Lock()
+        adapter._set_cardkit_streaming_mode = AsyncMock(
+            side_effect=RuntimeError("settings failed")
+        )
+        adapter._update_cardkit_card = AsyncMock()
+
+        asyncio.run(
+            adapter._close_cardkit_card_before_fallback(
+                "card_123",
+                "已降级",
+            )
+        )
+
+        self.assertNotIn("card_123", adapter._cardkit_sequences)
+        self.assertNotIn("card_123", adapter._cardkit_locks)
+        adapter._update_cardkit_card.assert_awaited_once()
+
+    def test_cardkit_edit_failure_releases_state_after_in_place_fallback(self):
+        from gateway.config import PlatformConfig
+        from plugins.platforms.feishu.adapter import FeishuAdapter
+
+        adapter = FeishuAdapter(
+            PlatformConfig(extra={"streaming_mode": "cardkit"})
+        )
+        update_method = object()
+        adapter._client = SimpleNamespace(
+            cardkit=SimpleNamespace(),
+            im=SimpleNamespace(
+                v1=SimpleNamespace(
+                    message=SimpleNamespace(update=update_method),
+                )
+            ),
+        )
+        adapter._cardkit_sequences["card_123"] = 3
+        adapter._cardkit_locks["card_123"] = asyncio.Lock()
+        adapter._stream_cardkit_content = AsyncMock(
+            side_effect=RuntimeError("content rejected")
+        )
+        adapter._close_cardkit_card_before_fallback = AsyncMock()
+        adapter._build_update_message_body = MagicMock(return_value="body")
+        adapter._build_update_message_request = MagicMock(
+            return_value=SimpleNamespace(message_id="om_123")
+        )
+        adapter._run_blocking = AsyncMock(
+            return_value=SimpleNamespace(success=lambda: True)
+        )
+
+        result = asyncio.run(
+            adapter.edit_message(
+                chat_id="oc_chat",
+                message_id="cardkit:card_123:om_123",
+                content="兼容结果",
+                metadata={"__hermes_streaming": True},
+            )
+        )
+
+        self.assertTrue(result.success)
+        self.assertEqual(result.message_id, "om_123")
+        self.assertNotIn("card_123", adapter._cardkit_sequences)
+        self.assertNotIn("card_123", adapter._cardkit_locks)
+        adapter._close_cardkit_card_before_fallback.assert_awaited_once()
+
+    def test_streaming_card_capabilities_are_config_gated(self):
+        from gateway.config import PlatformConfig
+        from plugins.platforms.feishu.adapter import FeishuAdapter
+
+        plain = FeishuAdapter(PlatformConfig())
+        card = FeishuAdapter(
+            PlatformConfig(extra={"streaming_mode": "card"})
+        )
+        cardkit = FeishuAdapter(
+            PlatformConfig(extra={"streaming_mode": "cardkit"})
+        )
+
+        self.assertFalse(plain.supports_single_streaming_message())
+        self.assertFalse(plain.REQUIRES_EDIT_FINALIZE)
+        self.assertTrue(card.supports_single_streaming_message())
+        self.assertTrue(card.REQUIRES_EDIT_FINALIZE)
+        self.assertFalse(card.supports_unified_stream_status())
+        self.assertTrue(cardkit.supports_single_streaming_message())
+        self.assertTrue(cardkit.REQUIRES_EDIT_FINALIZE)
+        self.assertTrue(cardkit.supports_unified_stream_status())
 
     @patch.dict(os.environ, {}, clear=True)
     def test_edit_message_falls_back_to_text_when_post_update_is_rejected(self):

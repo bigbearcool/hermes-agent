@@ -113,6 +113,28 @@ try:
     )
     from lark_oapi.event.dispatcher_handler import EventDispatcherHandler
     from lark_oapi.ws import Client as FeishuWSClient
+    try:
+        from lark_oapi.api.cardkit.v1.model import (
+            Card,
+            ContentCardElementRequest,
+            ContentCardElementRequestBody,
+            CreateCardRequest,
+            CreateCardRequestBody,
+            SettingsCardRequest,
+            SettingsCardRequestBody,
+            UpdateCardRequest,
+            UpdateCardRequestBody,
+        )
+    except ImportError:
+        Card = None  # type: ignore[assignment]
+        ContentCardElementRequest = None  # type: ignore[assignment]
+        ContentCardElementRequestBody = None  # type: ignore[assignment]
+        CreateCardRequest = None  # type: ignore[assignment]
+        CreateCardRequestBody = None  # type: ignore[assignment]
+        SettingsCardRequest = None  # type: ignore[assignment]
+        SettingsCardRequestBody = None  # type: ignore[assignment]
+        UpdateCardRequest = None  # type: ignore[assignment]
+        UpdateCardRequestBody = None  # type: ignore[assignment]
 
     FEISHU_AVAILABLE = True
 except ImportError:
@@ -124,6 +146,15 @@ except ImportError:
     FeishuWSClient = None  # type: ignore[assignment]
     FEISHU_DOMAIN = None  # type: ignore[assignment]
     LARK_DOMAIN = None  # type: ignore[assignment]
+    Card = None  # type: ignore[assignment]
+    ContentCardElementRequest = None  # type: ignore[assignment]
+    ContentCardElementRequestBody = None  # type: ignore[assignment]
+    CreateCardRequest = None  # type: ignore[assignment]
+    CreateCardRequestBody = None  # type: ignore[assignment]
+    SettingsCardRequest = None  # type: ignore[assignment]
+    SettingsCardRequestBody = None  # type: ignore[assignment]
+    UpdateCardRequest = None  # type: ignore[assignment]
+    UpdateCardRequestBody = None  # type: ignore[assignment]
 
 FEISHU_WEBSOCKET_AVAILABLE = websockets is not None
 FEISHU_WEBHOOK_AVAILABLE = aiohttp is not None
@@ -1400,6 +1431,23 @@ def check_feishu_requirements() -> bool:
         )
         from lark_oapi.event.dispatcher_handler import EventDispatcherHandler
         from lark_oapi.ws import Client as FeishuWSClient
+        try:
+            from lark_oapi.api.cardkit.v1.model import (
+                Card, ContentCardElementRequest, ContentCardElementRequestBody,
+                CreateCardRequest, CreateCardRequestBody,
+                SettingsCardRequest, SettingsCardRequestBody,
+                UpdateCardRequest, UpdateCardRequestBody,
+            )
+        except ImportError:
+            Card = None
+            ContentCardElementRequest = None
+            ContentCardElementRequestBody = None
+            CreateCardRequest = None
+            CreateCardRequestBody = None
+            SettingsCardRequest = None
+            SettingsCardRequestBody = None
+            UpdateCardRequest = None
+            UpdateCardRequestBody = None
         return {
             "lark": lark,
             "GetApplicationRequest": GetApplicationRequest,
@@ -1426,6 +1474,15 @@ def check_feishu_requirements() -> bool:
             "P2CardActionTriggerResponse": P2CardActionTriggerResponse,
             "EventDispatcherHandler": EventDispatcherHandler,
             "FeishuWSClient": FeishuWSClient,
+            "Card": Card,
+            "ContentCardElementRequest": ContentCardElementRequest,
+            "ContentCardElementRequestBody": ContentCardElementRequestBody,
+            "CreateCardRequest": CreateCardRequest,
+            "CreateCardRequestBody": CreateCardRequestBody,
+            "SettingsCardRequest": SettingsCardRequest,
+            "SettingsCardRequestBody": SettingsCardRequestBody,
+            "UpdateCardRequest": UpdateCardRequest,
+            "UpdateCardRequestBody": UpdateCardRequestBody,
             "FEISHU_AVAILABLE": True,
         }
 
@@ -1440,6 +1497,18 @@ class FeishuAdapter(BasePlatformAdapter):
     splits_long_messages = True  # send() chunks via truncate_message(MAX_MESSAGE_LENGTH)
 
     MAX_MESSAGE_LENGTH = 8000
+    MAX_STREAMING_CARD_CONTENT_LENGTH = 100_000
+    _STREAMING_CARD_ELEMENT_CHARS = 3500
+    _STREAMING_METADATA_KEY = "__hermes_streaming"
+    _STREAMING_CARD_MODES = {"card", "interactive", "interactive_card", "feishu_card"}
+    _STREAMING_CARDKIT_MODES = {"cardkit", "cardkit_card", "v2", "latest"}
+    _CARDKIT_MESSAGE_PREFIX = "cardkit:"
+    _CARDKIT_STREAM_ELEMENT_ID = "streaming_content"
+    _CARDKIT_FLUSH_TIMEOUT_SECONDS = 5.0
+    _CARDKIT_INITIAL_CONTENT = ""
+    _CARDKIT_LOADING_ICON_KEY = (
+        "img_v3_02vb_496bec09-4b43-4773-ad6b-0cdd103cd2bg"
+    )
     # Max distinct chat IDs retained in _chat_locks before LRU eviction kicks in.
     CHAT_LOCK_MAX_SIZE: int = 1000
     # Threshold for detecting Feishu client-side message splits.
@@ -1456,6 +1525,12 @@ class FeishuAdapter(BasePlatformAdapter):
 
         self._settings = self._load_settings(config.extra or {})
         self._apply_settings(self._settings)
+        self._streaming_mode = self._resolve_streaming_mode(config.extra or {})
+        self.REQUIRES_EDIT_FINALIZE = self._streaming_mode in (
+            self._STREAMING_CARD_MODES | self._STREAMING_CARDKIT_MODES
+        )
+        self._cardkit_sequences: Dict[str, int] = {}
+        self._cardkit_locks: Dict[str, asyncio.Lock] = {}
         self._client: Optional[Any] = None
         # Adapter-owned thread pool for blocking Feishu SDK calls. Routing SDK
         # work through this pool (instead of asyncio's shared default executor)
@@ -1512,6 +1587,571 @@ class FeishuAdapter(BasePlatformAdapter):
         # by create, so we cache it per message_id.
         self._pending_processing_reactions: "OrderedDict[str, str]" = OrderedDict()
         self._load_seen_message_ids()
+
+    @staticmethod
+    def _resolve_streaming_mode(extra: Dict[str, Any]) -> str:
+        """Return the configured Feishu streaming renderer."""
+        nested = extra.get("streaming") if isinstance(extra.get("streaming"), dict) else {}
+        raw = (
+            extra.get("streaming_mode")
+            or extra.get("streaming_renderer")
+            or nested.get("mode")
+            or nested.get("renderer")
+            or ""
+        )
+        return str(raw).strip().lower()
+
+    def _should_use_streaming_card(self, metadata: Optional[Dict[str, Any]]) -> bool:
+        return (
+            self._streaming_mode in self._STREAMING_CARD_MODES
+            and isinstance(metadata, dict)
+            and metadata.get(self._STREAMING_METADATA_KEY) is True
+        )
+
+    def _should_use_cardkit_streaming(self, metadata: Optional[Dict[str, Any]]) -> bool:
+        return (
+            self._streaming_mode in self._STREAMING_CARDKIT_MODES
+            and isinstance(metadata, dict)
+            and metadata.get(self._STREAMING_METADATA_KEY) is True
+        )
+
+    def supports_single_streaming_message(
+        self,
+        metadata: Optional[Dict[str, Any]] = None,
+    ) -> bool:
+        """Keep configured Feishu streaming cards in one visible message."""
+        probe_metadata = metadata or {self._STREAMING_METADATA_KEY: True}
+        return (
+            self._should_use_streaming_card(probe_metadata)
+            or self._should_use_cardkit_streaming(probe_metadata)
+        )
+
+    def supports_unified_stream_status(
+        self,
+        metadata: Optional[Dict[str, Any]] = None,
+    ) -> bool:
+        """Render commentary and tool status inside the active CardKit card."""
+        return self._should_use_cardkit_streaming(
+            metadata or {self._STREAMING_METADATA_KEY: True}
+        )
+
+    @classmethod
+    def _split_streaming_card_content(cls, content: str) -> List[str]:
+        """Split long content into card elements while preserving one card."""
+        text = str(content or "").strip() or " "
+        if len(text) > cls.MAX_STREAMING_CARD_CONTENT_LENGTH:
+            head_budget = cls.MAX_STREAMING_CARD_CONTENT_LENGTH // 2
+            tail_budget = cls.MAX_STREAMING_CARD_CONTENT_LENGTH - head_budget
+            text = (
+                text[:head_budget].rstrip()
+                + "\n\n---\n内容过长，中间部分已折叠。\n---\n\n"
+                + text[-tail_budget:].lstrip()
+            )
+
+        chunks: List[str] = []
+        remaining = text
+        while remaining:
+            if len(remaining) <= cls._STREAMING_CARD_ELEMENT_CHARS:
+                chunks.append(remaining)
+                break
+            split_at = remaining.rfind("\n", 0, cls._STREAMING_CARD_ELEMENT_CHARS)
+            if split_at < cls._STREAMING_CARD_ELEMENT_CHARS // 2:
+                split_at = cls._STREAMING_CARD_ELEMENT_CHARS
+            chunks.append(remaining[:split_at].rstrip())
+            remaining = remaining[split_at:].lstrip("\n")
+        return chunks or [" "]
+
+    @classmethod
+    def _build_streaming_card_payload(
+        cls,
+        content: str,
+        *,
+        finalize: bool = False,
+    ) -> str:
+        elements: List[Dict[str, Any]] = [
+            {"tag": "markdown", "content": chunk}
+            for chunk in cls._split_streaming_card_content(content)
+        ]
+        return json.dumps(
+            {
+                "config": {
+                    "wide_screen_mode": True,
+                    "update_multi": True,
+                    "streaming_mode": not finalize,
+                },
+                "elements": elements,
+            },
+            ensure_ascii=False,
+        )
+
+    @classmethod
+    def _build_cardkit_initial_card(cls) -> Dict[str, Any]:
+        return {
+            "schema": "2.0",
+            "config": {
+                "streaming_mode": True,
+                "locales": ["zh_cn", "en_us"],
+                "summary": {"content": "思考中..."},
+            },
+            "body": {
+                "elements": [
+                    {
+                        "tag": "markdown",
+                        "content": cls._CARDKIT_INITIAL_CONTENT,
+                        "text_align": "left",
+                        "text_size": "normal_v2",
+                        "element_id": cls._CARDKIT_STREAM_ELEMENT_ID,
+                    },
+                    {
+                        "tag": "markdown",
+                        "content": " ",
+                        "icon": {
+                            "tag": "custom_icon",
+                            "img_key": cls._CARDKIT_LOADING_ICON_KEY,
+                            "size": "16px 16px",
+                        },
+                        "element_id": "loading_icon",
+                    },
+                ]
+            },
+        }
+
+    @staticmethod
+    def _unified_stream_status_lines(status: Optional[Dict[str, Any]]) -> List[str]:
+        if not isinstance(status, dict):
+            return []
+        done = [str(item) for item in status.get("done", []) if str(item).strip()]
+        running = [str(item) for item in status.get("running", []) if str(item).strip()]
+        return (done + running)[-100:]
+
+    @staticmethod
+    def _unified_stream_call_records(
+        status: Optional[Dict[str, Any]],
+    ) -> List[Dict[str, Any]]:
+        if not isinstance(status, dict):
+            return []
+        records: List[Dict[str, Any]] = []
+        for item in status.get("calls", []):
+            if not isinstance(item, dict):
+                continue
+            name = str(item.get("name") or "").strip()
+            if not name:
+                continue
+            try:
+                round_number = max(1, int(item.get("round") or 1))
+            except (TypeError, ValueError):
+                round_number = 1
+            record = {
+                "round": round_number,
+                "name": name,
+                "status": str(item.get("status") or "running"),
+            }
+            try:
+                if item.get("duration") is not None:
+                    record["duration"] = max(
+                        0.0,
+                        float(item["duration"]),
+                    )
+            except (TypeError, ValueError):
+                pass
+            records.append(record)
+        return records[-100:]
+
+    @classmethod
+    def _format_tool_call_rounds(
+        cls,
+        status: Optional[Dict[str, Any]],
+        *,
+        streaming: bool,
+    ) -> str:
+        records = cls._unified_stream_call_records(status)
+        if not records:
+            return "\n".join(cls._unified_stream_status_lines(status))
+        grouped: Dict[int, List[Dict[str, Any]]] = {}
+        for record in records:
+            grouped.setdefault(int(record["round"]), []).append(record)
+        sections: List[str] = []
+        for round_number, calls in grouped.items():
+            lines = [
+                (
+                    f"**工具调用 · 第 {round_number} 轮**"
+                    if streaming
+                    else f"**第 {round_number} 轮**"
+                )
+            ]
+            for call in calls:
+                state = str(call["status"])
+                if state == "done":
+                    icon = "✅"
+                elif state == "failed":
+                    icon = "❌"
+                else:
+                    icon = "⏳"
+                duration = call.get("duration")
+                duration_text = (
+                    f" · {float(duration):.1f}s"
+                    if duration is not None
+                    else ""
+                )
+                lines.append(
+                    f"{icon} `{call['name']}`{duration_text}"
+                )
+            sections.append("\n".join(lines))
+        return "\n\n".join(sections)
+
+    @classmethod
+    def _compose_unified_stream_content(
+        cls,
+        content: str,
+        metadata: Optional[Dict[str, Any]],
+    ) -> str:
+        if not isinstance(metadata, dict):
+            return content
+        status = metadata.get("__hermes_stream_status")
+        progress_section = cls._format_tool_call_rounds(
+            status,
+            streaming=True,
+        )
+        if not progress_section:
+            return content or ""
+        if not content:
+            return progress_section
+        return f"{progress_section}\n\n---\n\n{content}"
+
+    @classmethod
+    def _strip_status_only_stream_cursor(
+        cls,
+        content: str,
+        metadata: Optional[Dict[str, Any]],
+    ) -> str:
+        if not isinstance(metadata, dict) or not isinstance(
+            metadata.get("__hermes_stream_status"), dict
+        ):
+            return content
+        text = str(content or "")
+        return "" if not text.replace("▉", "").strip() else content
+
+    @classmethod
+    def _build_final_cardkit_card(
+        cls,
+        content: str,
+        *,
+        tool_status: Optional[Dict[str, Any]] = None,
+        elapsed_seconds: Optional[float] = None,
+        model_name: str = "",
+    ) -> Dict[str, Any]:
+        elements: List[Dict[str, Any]] = [
+            {
+                "tag": "markdown",
+                "content": chunk or "...",
+                "text_align": "left",
+                "text_size": "normal_v2",
+                "element_id": f"hermes_final_{idx}",
+            }
+            for idx, chunk in enumerate(
+                cls._split_streaming_card_content(content),
+                start=1,
+            )
+        ]
+        tool_records = cls._unified_stream_call_records(tool_status)
+        tool_log = cls._format_tool_call_rounds(
+            tool_status,
+            streaming=False,
+        )
+        if tool_log:
+            tool_elements = [
+                {
+                    "tag": "markdown",
+                    "content": chunk,
+                    "text_size": "notation",
+                    "element_id": f"tool_log_{idx}",
+                }
+                for idx, chunk in enumerate(
+                    cls._split_streaming_card_content(tool_log),
+                    start=1,
+                )
+            ]
+            elements.append(
+                {
+                    "tag": "collapsible_panel",
+                    "element_id": "tool_trace",
+                    "expanded": False,
+                    "direction": "vertical",
+                    "background_color": "grey",
+                    "header": {
+                        "title": {
+                            "tag": "markdown",
+                            "content": (
+                                f"**工具调用记录（{len(tool_records) or len(cls._unified_stream_status_lines(tool_status))}）**"
+                            ),
+                        }
+                    },
+                    "elements": tool_elements,
+                }
+            )
+        footer_parts: List[str] = []
+        if model_name.strip():
+            footer_parts.append(f"🤖 {model_name.strip()}")
+        if elapsed_seconds is not None:
+            footer_parts.append(f"⏱ {max(0.0, elapsed_seconds):.1f}s")
+        if isinstance(tool_status, dict):
+            tool_count = len(tool_records)
+            if not tool_count:
+                tool_count = len(
+                    [
+                        item
+                        for item in tool_status.get("done", [])
+                        if str(item).strip()
+                    ]
+                )
+            if tool_count:
+                footer_parts.append(f"🔧 {tool_count} tools")
+        if footer_parts:
+            elements.extend(
+                [
+                    {"tag": "hr"},
+                    {
+                        "tag": "markdown",
+                        "content": (
+                            "<font color='grey'>"
+                            + " · ".join(footer_parts)
+                            + "</font>"
+                        ),
+                        "text_size": "notation",
+                        "element_id": "final_footer",
+                    },
+                ]
+            )
+        return {
+            "schema": "2.0",
+            "config": {
+                "wide_screen_mode": True,
+                "update_multi": True,
+            },
+            "body": {"elements": elements},
+        }
+
+    @staticmethod
+    def _build_cardkit_terminal_notice(content: str) -> Dict[str, Any]:
+        return {
+            "schema": "2.0",
+            "config": {
+                "wide_screen_mode": True,
+                "update_multi": True,
+            },
+            "body": {
+                "elements": [
+                    {
+                        "tag": "markdown",
+                        "content": content or "已切换到兼容卡片。",
+                        "element_id": "fallback_notice",
+                    }
+                ]
+            },
+        }
+
+    @classmethod
+    def _parse_cardkit_message_id(cls, message_id: str) -> Optional[tuple[str, str]]:
+        text = str(message_id or "")
+        if not text.startswith(cls._CARDKIT_MESSAGE_PREFIX):
+            return None
+        parts = text.split(":", 2)
+        if len(parts) != 3 or not parts[1] or not parts[2]:
+            return None
+        return parts[1], parts[2]
+
+    @classmethod
+    def _make_cardkit_message_id(cls, card_id: str, im_message_id: str) -> str:
+        return f"{cls._CARDKIT_MESSAGE_PREFIX}{card_id}:{im_message_id}"
+
+    def _cardkit_available(self) -> bool:
+        return bool(
+            self._client is not None
+            and getattr(self._client, "cardkit", None) is not None
+            and CreateCardRequest is not None
+            and CreateCardRequestBody is not None
+            and ContentCardElementRequest is not None
+            and ContentCardElementRequestBody is not None
+            and SettingsCardRequest is not None
+            and SettingsCardRequestBody is not None
+            and UpdateCardRequest is not None
+            and UpdateCardRequestBody is not None
+            and Card is not None
+        )
+
+    def _next_cardkit_sequence(self, card_id: str) -> int:
+        sequence = int(self._cardkit_sequences.get(card_id, 0) or 0) + 1
+        self._cardkit_sequences[card_id] = sequence
+        return sequence
+
+    def _cardkit_lock(self, card_id: str) -> asyncio.Lock:
+        lock = self._cardkit_locks.get(card_id)
+        if lock is None:
+            lock = asyncio.Lock()
+            self._cardkit_locks[card_id] = lock
+        return lock
+
+    def _cleanup_cardkit_state(self, card_id: str) -> None:
+        self._cardkit_sequences.pop(card_id, None)
+        self._cardkit_locks.pop(card_id, None)
+
+    async def _create_cardkit_card(self, card: Dict[str, Any]) -> str:
+        if not self._cardkit_available():
+            raise RuntimeError("CardKit SDK is unavailable")
+        body = (
+            CreateCardRequestBody.builder()
+            .type("card_json")
+            .data(json.dumps(card, ensure_ascii=False))
+            .build()
+        )
+        request = CreateCardRequest.builder().request_body(body).build()
+        response = await asyncio.wait_for(
+            self._run_blocking(self._client.cardkit.v1.card.create, request),
+            timeout=self._CARDKIT_FLUSH_TIMEOUT_SECONDS,
+        )
+        if not self._response_succeeded(response):
+            raise RuntimeError(
+                self._response_error_result(
+                    response,
+                    default_message="cardkit create failed",
+                ).error
+            )
+        card_id = self._extract_response_field(response, "card_id")
+        if not card_id:
+            raise RuntimeError("CardKit create response missing card_id")
+        # CardKit reserves sequence 1 for the newly-created entity.  Mutations
+        # begin at 2, matching Feishu's live API and the Xiaosheng CardKit
+        # implementation.  Starting mutations at 1 can survive creation but
+        # later fails during final settings/update with 300317.
+        self._cardkit_sequences[str(card_id)] = 1
+        return str(card_id)
+
+    async def _stream_cardkit_content(self, card_id: str, content: str) -> None:
+        if not self._cardkit_available():
+            raise RuntimeError("CardKit SDK is unavailable")
+        body = (
+            ContentCardElementRequestBody.builder()
+            .content(content or " ")
+            .sequence(self._next_cardkit_sequence(card_id))
+            .uuid(str(uuid.uuid4()))
+            .build()
+        )
+        request = (
+            ContentCardElementRequest.builder()
+            .card_id(card_id)
+            .element_id(self._CARDKIT_STREAM_ELEMENT_ID)
+            .request_body(body)
+            .build()
+        )
+        response = await asyncio.wait_for(
+            self._run_blocking(
+                self._client.cardkit.v1.card_element.content,
+                request,
+            ),
+            timeout=self._CARDKIT_FLUSH_TIMEOUT_SECONDS,
+        )
+        if not self._response_succeeded(response):
+            raise RuntimeError(
+                self._response_error_result(
+                    response,
+                    default_message="cardkit content update failed",
+                ).error
+            )
+
+    async def _set_cardkit_streaming_mode(
+        self,
+        card_id: str,
+        streaming_mode: int,
+    ) -> None:
+        if not self._cardkit_available():
+            raise RuntimeError("CardKit SDK is unavailable")
+        body = (
+            SettingsCardRequestBody.builder()
+            .settings(json.dumps({"streaming_mode": streaming_mode}))
+            .sequence(self._next_cardkit_sequence(card_id))
+            .uuid(str(uuid.uuid4()))
+            .build()
+        )
+        request = (
+            SettingsCardRequest.builder()
+            .card_id(card_id)
+            .request_body(body)
+            .build()
+        )
+        response = await asyncio.wait_for(
+            self._run_blocking(self._client.cardkit.v1.card.settings, request),
+            timeout=self._CARDKIT_FLUSH_TIMEOUT_SECONDS,
+        )
+        if not self._response_succeeded(response):
+            raise RuntimeError(
+                self._response_error_result(
+                    response,
+                    default_message="cardkit settings failed",
+                ).error
+            )
+
+    async def _update_cardkit_card(
+        self,
+        card_id: str,
+        card: Dict[str, Any],
+    ) -> None:
+        if not self._cardkit_available():
+            raise RuntimeError("CardKit SDK is unavailable")
+        card_body = (
+            Card.builder()
+            .type("card_json")
+            .data(json.dumps(card, ensure_ascii=False))
+            .build()
+        )
+        body = (
+            UpdateCardRequestBody.builder()
+            .card(card_body)
+            .sequence(self._next_cardkit_sequence(card_id))
+            .uuid(str(uuid.uuid4()))
+            .build()
+        )
+        request = (
+            UpdateCardRequest.builder()
+            .card_id(card_id)
+            .request_body(body)
+            .build()
+        )
+        response = await asyncio.wait_for(
+            self._run_blocking(self._client.cardkit.v1.card.update, request),
+            timeout=self._CARDKIT_FLUSH_TIMEOUT_SECONDS,
+        )
+        if not self._response_succeeded(response):
+            raise RuntimeError(
+                self._response_error_result(
+                    response,
+                    default_message="cardkit update failed",
+                ).error
+            )
+
+    async def _close_cardkit_card_before_fallback(
+        self,
+        card_id: Optional[str],
+        content: str,
+        *,
+        cleanup: bool = True,
+    ) -> None:
+        if not card_id:
+            return
+        try:
+            try:
+                await self._set_cardkit_streaming_mode(card_id, 0)
+            except Exception as exc:
+                logger.warning("[Feishu] Failed to stop orphan CardKit streaming: %s", exc)
+            try:
+                await self._update_cardkit_card(
+                    card_id,
+                    self._build_cardkit_terminal_notice(content),
+                )
+            except Exception as exc:
+                logger.warning("[Feishu] Failed to update orphan CardKit notice: %s", exc)
+        finally:
+            if cleanup:
+                self._cleanup_cardkit_state(card_id)
 
     @staticmethod
     def _load_settings(extra: Dict[str, Any]) -> FeishuAdapterSettings:
@@ -1855,6 +2495,8 @@ class FeishuAdapter(BasePlatformAdapter):
         self._loop = None
         self._event_handler = None
         self._shutdown_sdk_executor()
+        self._cardkit_sequences.clear()
+        self._cardkit_locks.clear()
         self._persist_seen_message_ids()
         await self._release_app_lock()
 
@@ -1921,6 +2563,112 @@ class FeishuAdapter(BasePlatformAdapter):
         last_response = None
 
         try:
+            if self._should_use_cardkit_streaming(metadata):
+                card_id: Optional[str] = None
+                try:
+                    card_id = await self._create_cardkit_card(
+                        self._build_cardkit_initial_card()
+                    )
+                    response = await self._feishu_send_with_retry(
+                        chat_id=chat_id,
+                        msg_type="interactive",
+                        payload=json.dumps(
+                            {"type": "card", "data": {"card_id": card_id}},
+                            ensure_ascii=False,
+                        ),
+                        reply_to=reply_to,
+                        metadata=metadata,
+                    )
+                    result = self._finalize_send_result(
+                        response,
+                        "cardkit message send failed",
+                    )
+                    if result.success and result.message_id:
+                        im_message_id = str(result.message_id)
+                        result.message_id = self._make_cardkit_message_id(
+                            card_id,
+                            im_message_id,
+                        )
+                        initial_content = self._compose_unified_stream_content(
+                            self._strip_status_only_stream_cursor(formatted, metadata),
+                            metadata,
+                        )
+                        if initial_content.strip():
+                            try:
+                                await self._stream_cardkit_content(
+                                    card_id,
+                                    initial_content,
+                                )
+                            except Exception as exc:
+                                logger.warning(
+                                    "[Feishu] CardKit initial content stream failed; "
+                                    "replacing the reference message with a compatible card: %s",
+                                    exc,
+                                )
+                                await self._close_cardkit_card_before_fallback(
+                                    card_id,
+                                    "CardKit 更新失败，已切换到兼容卡片。",
+                                )
+                                card_id = None
+                                fallback_payload = self._build_streaming_card_payload(
+                                    self._compose_unified_stream_content(
+                                        formatted,
+                                        metadata,
+                                    )
+                                )
+                                fallback_body = self._build_update_message_body(
+                                    msg_type="interactive",
+                                    content=fallback_payload,
+                                )
+                                fallback_request = self._build_update_message_request(
+                                    message_id=im_message_id,
+                                    request_body=fallback_body,
+                                )
+                                fallback_response = await self._run_blocking(
+                                    self._client.im.v1.message.update,
+                                    fallback_request,
+                                )
+                                fallback_result = self._finalize_send_result(
+                                    fallback_response,
+                                    "streaming card update failed",
+                                )
+                                if not fallback_result.success:
+                                    raise RuntimeError(
+                                        fallback_result.error
+                                        or "streaming card update failed"
+                                    )
+                                fallback_result.message_id = im_message_id
+                                return fallback_result
+                        return result
+                    raise RuntimeError(result.error or "cardkit message send failed")
+                except Exception as exc:
+                    logger.warning(
+                        "[Feishu] CardKit flow failed; falling back to interactive card: %s",
+                        exc,
+                    )
+                    await self._close_cardkit_card_before_fallback(
+                        card_id,
+                        "CardKit 创建失败，已切换到兼容卡片。",
+                    )
+
+            if (
+                self._should_use_streaming_card(metadata)
+                or self._should_use_cardkit_streaming(metadata)
+            ):
+                response = await self._feishu_send_with_retry(
+                    chat_id=chat_id,
+                    msg_type="interactive",
+                    payload=self._build_streaming_card_payload(
+                        self._compose_unified_stream_content(formatted, metadata),
+                    ),
+                    reply_to=reply_to,
+                    metadata=metadata,
+                )
+                return self._finalize_send_result(
+                    response,
+                    "streaming card send failed",
+                )
+
             for chunk in chunks:
                 msg_type, payload = self._build_outbound_payload(
                     chunk, prefer_post=prefer_post,
@@ -1971,6 +2719,7 @@ class FeishuAdapter(BasePlatformAdapter):
         content: str,
         *,
         finalize: bool = False,
+        metadata: Optional[Dict[str, Any]] = None,
     ) -> SendResult:
         """Edit a previously sent Feishu text/post message."""
         if not self._client:
@@ -1978,6 +2727,97 @@ class FeishuAdapter(BasePlatformAdapter):
 
         content = self.format_message(content)
         try:
+            parsed_cardkit = self._parse_cardkit_message_id(message_id)
+            if parsed_cardkit:
+                card_id, im_message_id = parsed_cardkit
+                async with self._cardkit_lock(card_id):
+                    try:
+                        if finalize:
+                            await self._set_cardkit_streaming_mode(card_id, 0)
+                            await self._update_cardkit_card(
+                                card_id,
+                                self._build_final_cardkit_card(
+                                    content,
+                                    tool_status=(
+                                        metadata.get("__hermes_stream_status")
+                                        if isinstance(metadata, dict)
+                                        else None
+                                    ),
+                                    elapsed_seconds=(
+                                        metadata.get(
+                                            "__hermes_stream_elapsed_seconds"
+                                        )
+                                        if isinstance(metadata, dict)
+                                        else None
+                                    ),
+                                    model_name=(
+                                        str(
+                                            metadata.get(
+                                                "__hermes_stream_model",
+                                                "",
+                                            )
+                                        )
+                                        if isinstance(metadata, dict)
+                                        else ""
+                                    ),
+                                ),
+                            )
+                        else:
+                            await self._stream_cardkit_content(
+                                card_id,
+                                self._compose_unified_stream_content(
+                                    content,
+                                    metadata,
+                                ),
+                            )
+                        return SendResult(
+                            success=True,
+                            message_id=message_id,
+                        )
+                    except Exception as exc:
+                        logger.warning(
+                            "[Feishu] CardKit update failed; "
+                            "falling back to interactive card: %s",
+                            exc,
+                        )
+                        await self._close_cardkit_card_before_fallback(
+                            card_id,
+                            "CardKit 更新失败，已切换到兼容卡片。",
+                            cleanup=False,
+                        )
+                        message_id = im_message_id
+                    finally:
+                        if finalize or message_id == im_message_id:
+                            self._cleanup_cardkit_state(card_id)
+
+            if (
+                self._should_use_streaming_card(metadata)
+                or self._should_use_cardkit_streaming(metadata)
+            ):
+                payload = self._build_streaming_card_payload(
+                    self._compose_unified_stream_content(content, metadata),
+                    finalize=finalize,
+                )
+                body = self._build_update_message_body(
+                    msg_type="interactive",
+                    content=payload,
+                )
+                request = self._build_update_message_request(
+                    message_id=message_id,
+                    request_body=body,
+                )
+                response = await self._run_blocking(
+                    self._client.im.v1.message.update,
+                    request,
+                )
+                result = self._finalize_send_result(
+                    response,
+                    "streaming card update failed",
+                )
+                if result.success:
+                    result.message_id = message_id
+                return result
+
             msg_type, payload = self._build_outbound_payload(content)
             body = self._build_update_message_body(msg_type=msg_type, content=payload)
             request = self._build_update_message_request(message_id=message_id, request_body=body)
