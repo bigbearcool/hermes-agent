@@ -634,6 +634,7 @@ class TestFeishuAdapterMessaging(unittest.TestCase):
         )
         self.assertNotIn("header", final)
         self.assertNotIn("summary", final["config"])
+        self.assertFalse(final["config"]["streaming_mode"])
         self.assertEqual(final["body"]["elements"][0]["content"], "最终答案")
         tool_trace = final["body"]["elements"][1]
         self.assertEqual(tool_trace["tag"], "collapsible_panel")
@@ -654,6 +655,7 @@ class TestFeishuAdapterMessaging(unittest.TestCase):
         self.assertIn("⏱ 1.2s", footer["content"])
         self.assertIn("🔧 1 tools", footer["content"])
         terminal = FeishuAdapter._build_cardkit_terminal_notice("已降级")
+        self.assertFalse(terminal["config"]["streaming_mode"])
 
         def _element_ids(value):
             if isinstance(value, dict):
@@ -824,12 +826,10 @@ class TestFeishuAdapterMessaging(unittest.TestCase):
         )
 
         self.assertTrue(result.success)
-        adapter._set_cardkit_streaming_mode.assert_awaited_once_with(
-            "card_123",
-            0,
-        )
+        adapter._set_cardkit_streaming_mode.assert_not_awaited()
         final_card = adapter._update_cardkit_card.await_args.args[1]
         final_payload = json.dumps(final_card, ensure_ascii=False)
+        self.assertFalse(final_card["config"]["streaming_mode"])
         self.assertIn("最终答案", final_payload)
         self.assertIn("✅ read_file (0.2s)", final_payload)
         self.assertIn("工具调用记录（1）", final_payload)
@@ -896,6 +896,34 @@ class TestFeishuAdapterMessaging(unittest.TestCase):
         self.assertNotIn("card_123", adapter._cardkit_sequences)
         self.assertNotIn("card_123", adapter._cardkit_locks)
         adapter._update_cardkit_card.assert_awaited_once()
+        adapter._set_cardkit_streaming_mode.assert_not_awaited()
+
+    def test_cardkit_fallback_uses_settings_only_when_terminal_update_fails(self):
+        from gateway.config import PlatformConfig
+        from plugins.platforms.feishu.adapter import FeishuAdapter
+
+        adapter = FeishuAdapter(
+            PlatformConfig(extra={"streaming_mode": "cardkit"})
+        )
+        adapter._cardkit_sequences["card_123"] = 2
+        adapter._update_cardkit_card = AsyncMock(
+            side_effect=RuntimeError("update failed")
+        )
+        adapter._set_cardkit_streaming_mode = AsyncMock()
+
+        asyncio.run(
+            adapter._close_cardkit_card_before_fallback(
+                "card_123",
+                "已降级",
+            )
+        )
+
+        adapter._update_cardkit_card.assert_awaited_once()
+        adapter._set_cardkit_streaming_mode.assert_awaited_once_with(
+            "card_123",
+            0,
+        )
+        self.assertNotIn("card_123", adapter._cardkit_sequences)
 
     def test_cardkit_edit_failure_releases_state_after_in_place_fallback(self):
         from gateway.config import PlatformConfig

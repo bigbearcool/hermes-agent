@@ -521,6 +521,20 @@ class GatewayStreamConsumer:
         the subsequent cosmetic edit (cursor removal) failed."""
         return self._final_content_delivered
 
+    def has_incomplete_visible_stream(self) -> bool:
+        """Return whether a user-visible streaming message is still open.
+
+        This method is intentionally synchronous: the agent worker uses it as
+        a best-effort guard before proactive context compression.  A message
+        ID proves the platform has already rendered the stream; completion
+        flags prove the final card/message has not landed yet.
+        """
+        return bool(
+            self._message_id
+            and not self._final_response_sent
+            and not self._final_content_delivered
+        )
+
     async def _notify_before_finalize(self) -> None:
         """Run the pre-finalize hook exactly once, swallowing hook errors."""
         if self._before_finalize_notified:
@@ -1137,6 +1151,7 @@ class GatewayStreamConsumer:
                     # the next segment (tool progress, next chunk) creates a
                     # new message below it.  got_done has its own finalize
                     # path below so we don't finalize here for it.
+                    had_edit_target = self._message_id is not None
                     current_update_visible = await self._send_or_edit(
                         display_text,
                         finalize=(got_done or got_segment_break),
@@ -1174,18 +1189,22 @@ class GatewayStreamConsumer:
                             and (
                                 not self._adapter_requires_finalize
                                 or self._last_edit_overflowed
+                                or (
+                                    self._single_streaming_message
+                                    and had_edit_target
+                                )
                             )
                         ):
                             # Mid-stream edit above already delivered the
-                            # final accumulated content.  Skip the redundant
-                            # final edit for adapters that don't need an
-                            # explicit finalize signal, and for any adapter
-                            # when that edit split-and-delivered across
-                            # continuations: the split edit carried
-                            # finalize=True itself, and re-finalizing with
-                            # the full text would overflow-split again into
-                            # the adopted continuation, duplicating chunks
-                            # on screen.
+                            # final accumulated content with ``finalize=True``.
+                            # Skip the redundant final edit for adapters that
+                            # don't need an explicit finalize signal, for
+                            # single-message streaming adapters (their first
+                            # finalize is terminal), and for any adapter when
+                            # that edit split-and-delivered across
+                            # continuations.  Re-finalizing a CardKit message
+                            # after it has closed streaming mode produces
+                            # Feishu 300309/300317 errors.
                             self._final_response_sent = True
                             self._final_content_delivered = True
                         elif self._message_id:

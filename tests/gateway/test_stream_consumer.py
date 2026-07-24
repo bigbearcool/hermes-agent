@@ -366,6 +366,70 @@ class TestFinalizeCapabilityGate:
         picky.edit_message.assert_called_once()
         assert picky.edit_message.call_args[1]["finalize"] is True
 
+    @pytest.mark.asyncio
+    async def test_single_message_adapter_does_not_finalize_existing_card_twice(self):
+        """A CardKit-style message is closed by the got_done edit itself."""
+        adapter = MagicMock()
+        adapter.REQUIRES_EDIT_FINALIZE = True
+        adapter.edit_message = AsyncMock(return_value=SimpleNamespace(
+            success=True,
+            message_id="cardkit:card_1:msg_1",
+        ))
+        adapter.MAX_MESSAGE_LENGTH = 4096
+
+        consumer = GatewayStreamConsumer(adapter, "chat_1")
+        consumer._single_streaming_message = True
+        consumer._message_id = "cardkit:card_1:msg_1"
+        consumer._already_sent = True
+        consumer._last_sent_text = "partial"
+        consumer.on_delta("complete")
+        consumer.finish()
+
+        await consumer.run()
+
+        adapter.edit_message.assert_awaited_once()
+        assert adapter.edit_message.await_args.kwargs["finalize"] is True
+        assert consumer.final_response_sent is True
+
+    @pytest.mark.asyncio
+    async def test_single_message_adapter_finalizes_after_first_done_send(self):
+        """A response first sent on got_done still receives one closing edit."""
+        adapter = MagicMock()
+        adapter.REQUIRES_EDIT_FINALIZE = True
+        adapter.send = AsyncMock(return_value=SimpleNamespace(
+            success=True,
+            message_id="cardkit:card_1:msg_1",
+        ))
+        adapter.edit_message = AsyncMock(return_value=SimpleNamespace(
+            success=True,
+            message_id="cardkit:card_1:msg_1",
+        ))
+        adapter.MAX_MESSAGE_LENGTH = 4096
+
+        consumer = GatewayStreamConsumer(adapter, "chat_1")
+        consumer._single_streaming_message = True
+        consumer.on_delta("complete")
+        consumer.finish()
+
+        await consumer.run()
+
+        adapter.send.assert_awaited_once()
+        adapter.edit_message.assert_awaited_once()
+        assert adapter.edit_message.await_args.kwargs["finalize"] is True
+
+    def test_visible_stream_compression_guard_tracks_completion(self):
+        adapter = MagicMock()
+        adapter.MAX_MESSAGE_LENGTH = 4096
+        consumer = GatewayStreamConsumer(adapter, "chat_1")
+
+        assert consumer.has_incomplete_visible_stream() is False
+
+        consumer._message_id = "cardkit:card_1:msg_1"
+        assert consumer.has_incomplete_visible_stream() is True
+
+        consumer._final_content_delivered = True
+        assert consumer.has_incomplete_visible_stream() is False
+
 
 class TestEditMessageFinalizeSignature:
     """Every concrete platform adapter must accept the ``finalize`` kwarg.

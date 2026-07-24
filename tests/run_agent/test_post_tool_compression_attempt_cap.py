@@ -151,6 +151,15 @@ def _run_tool_loop(agent, n_tool_iterations: int):
 
 
 class TestPostToolCompressionAttemptCap:
+    def test_post_tool_compression_waits_for_visible_stream(self, agent):
+        """Proactive compaction must not stall an already-visible card."""
+        agent.compression_defer_callback = lambda: True
+
+        result, compress_calls = _run_tool_loop(agent, n_tool_iterations=3)
+
+        assert result["completed"] is True
+        assert compress_calls == []
+
     def test_post_tool_compression_capped_at_default_three(self, agent):
         """7 tool iterations under constant pressure → exactly 3 compactions.
 

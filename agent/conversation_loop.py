@@ -716,6 +716,27 @@ def _sync_failover_system_message(agent, api_messages, active_system_prompt):
     return sp
 
 
+def _proactive_compression_deferred_for_visible_stream(agent: Any) -> bool:
+    """Return whether optional compression should wait for stream completion.
+
+    Gateway adapters install this per turn.  Fail open for CLI/library callers
+    and for callback errors so a presentation-layer check can never wedge the
+    core agent loop.  Provider-proven overflow recovery intentionally does not
+    use this guard.
+    """
+    callback = getattr(agent, "compression_defer_callback", None)
+    if not callable(callback):
+        return False
+    try:
+        return callback() is True
+    except Exception:
+        logger.debug(
+            "compression defer callback failed; continuing normally",
+            exc_info=True,
+        )
+        return False
+
+
 def _apply_context_engine_selection(
     agent: Any,
     api_messages: List[Dict[str, Any]],
@@ -1542,6 +1563,21 @@ def run_conversation(
         _compression_cooldown = getattr(
             _compressor, "get_active_compression_failure_cooldown", lambda: None
         )()
+        _visible_stream_blocks_proactive_compression = (
+            _proactive_compression_deferred_for_visible_stream(agent)
+        )
+        if (
+            agent.compression_enabled
+            and _visible_stream_blocks_proactive_compression
+            and request_pressure_tokens >= _preflight_threshold
+        ):
+            logger.info(
+                "Deferring pre-API compression until the visible stream "
+                "completes (session=%s, tokens=~%s, threshold=%s)",
+                agent.session_id or "none",
+                f"{request_pressure_tokens:,}",
+                f"{_preflight_threshold:,}",
+            )
         if (
             agent.compression_enabled
             and len(messages) > 1
@@ -1549,6 +1585,7 @@ def run_conversation(
             and not _preflight_compression_blocked
             and not _defer_preflight(request_pressure_tokens)
             and not _compression_cooldown
+            and not _visible_stream_blocks_proactive_compression
             and _compressor.should_compress(request_pressure_tokens)
         ):
             if _moa_prepared_request is not None:
@@ -5764,6 +5801,16 @@ def run_conversation(
                     )
 
                 if (
+                    agent.compression_enabled
+                    and _proactive_compression_deferred_for_visible_stream(agent)
+                ):
+                    logger.info(
+                        "Deferring post-tool compression until the visible "
+                        "stream completes (session=%s, tokens=~%s)",
+                        agent.session_id or "none",
+                        f"{_real_tokens:,}",
+                    )
+                elif (
                     agent.compression_enabled
                     and compression_attempts < max_compression_attempts
                     and _compressor.should_compress(_real_tokens)

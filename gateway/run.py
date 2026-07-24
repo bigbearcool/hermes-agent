@@ -21547,6 +21547,15 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             agent.step_callback = _step_callback_sync if _hooks_ref.loaded_hooks else None
             agent.stream_delta_callback = _stream_delta_cb
             agent.interim_assistant_callback = _interim_assistant_cb if _want_interim_messages else None
+            # Proactive compression may take minutes on long sessions. Once a
+            # platform stream is visible, defer that optional work until the
+            # card/message is complete (normally the next turn's preflight).
+            # Provider-proven overflow recovery remains available.
+            agent.compression_defer_callback = (
+                _stream_consumer.has_incomplete_visible_stream
+                if _stream_consumer is not None
+                else None
+            )
             agent.status_callback = _status_callback_sync
             # Credits / out-of-band notices (usage bands, depletion, restored).
             # Messaging has no persistent status bar, so each notice is a

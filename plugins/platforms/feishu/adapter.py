@@ -1925,6 +1925,7 @@ class FeishuAdapter(BasePlatformAdapter):
         return {
             "schema": "2.0",
             "config": {
+                "streaming_mode": False,
                 "wide_screen_mode": True,
                 "update_multi": True,
             },
@@ -1936,6 +1937,7 @@ class FeishuAdapter(BasePlatformAdapter):
         return {
             "schema": "2.0",
             "config": {
+                "streaming_mode": False,
                 "wide_screen_mode": True,
                 "update_multi": True,
             },
@@ -2139,16 +2141,24 @@ class FeishuAdapter(BasePlatformAdapter):
             return
         try:
             try:
-                await self._set_cardkit_streaming_mode(card_id, 0)
-            except Exception as exc:
-                logger.warning("[Feishu] Failed to stop orphan CardKit streaming: %s", exc)
-            try:
+                # Replace the card and close streaming in one sequenced
+                # mutation.  Closing through ``card.settings`` first ends the
+                # streaming sequence window; a following full-card update
+                # then races that boundary and Feishu rejects it with 300317
+                # ("sequence number compare failed").
                 await self._update_cardkit_card(
                     card_id,
                     self._build_cardkit_terminal_notice(content),
                 )
             except Exception as exc:
                 logger.warning("[Feishu] Failed to update orphan CardKit notice: %s", exc)
+                try:
+                    await self._set_cardkit_streaming_mode(card_id, 0)
+                except Exception as close_exc:
+                    logger.warning(
+                        "[Feishu] Failed to stop orphan CardKit streaming: %s",
+                        close_exc,
+                    )
         finally:
             if cleanup:
                 self._cleanup_cardkit_state(card_id)
@@ -2733,7 +2743,9 @@ class FeishuAdapter(BasePlatformAdapter):
                 async with self._cardkit_lock(card_id):
                     try:
                         if finalize:
-                            await self._set_cardkit_streaming_mode(card_id, 0)
+                            # The final card declares ``streaming_mode=false``.
+                            # Apply it as one mutation so the final rich card
+                            # remains inside the same streaming sequence.
                             await self._update_cardkit_card(
                                 card_id,
                                 self._build_final_cardkit_card(

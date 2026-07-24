@@ -956,6 +956,38 @@ class TestPreflightCompression:
             for ev, msg in status_messages
         )
 
+    def test_pre_api_compression_waits_for_visible_stream(self, agent):
+        """A visible streaming card must not pause for proactive compaction."""
+        agent.compression_enabled = True
+        agent.context_compressor.context_length = 200_000
+        agent.context_compressor.threshold_tokens = 130_000
+        agent.compression_defer_callback = lambda: True
+
+        history = [
+            {"role": "user", "content": "earlier question"},
+            {"role": "assistant", "content": "earlier answer"},
+        ]
+        agent.client.chat.completions.create.side_effect = [
+            _mock_response(content="Without mid-card compression", finish_reason="stop")
+        ]
+
+        with (
+            patch("agent.turn_context.estimate_request_tokens_rough", return_value=10_000),
+            patch("agent.conversation_loop.estimate_request_tokens_rough", return_value=144_669),
+            patch(
+                "agent.conversation_loop.estimate_messages_tokens_rough",
+                return_value=144_669,
+            ),
+            patch.object(agent, "_compress_context") as mock_compress,
+            patch.object(agent, "_persist_session"),
+            patch.object(agent, "_save_trajectory"),
+            patch.object(agent, "_cleanup_task_resources"),
+        ):
+            result = agent.run_conversation("hello", conversation_history=history)
+
+        assert result["completed"] is True
+        mock_compress.assert_not_called()
+
     def test_preflight_compresses_oversized_history(self, agent):
         """When loaded history exceeds the model's context threshold, compress before API call."""
         agent.compression_enabled = True
