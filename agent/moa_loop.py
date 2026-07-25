@@ -748,10 +748,11 @@ def _run_references_parallel(
     another MoA preset are skipped here (recursion guard) with a labelled note.
 
     If ``progress_callback`` is provided it is invoked as each reference
-    completes: ``progress_callback(refs_done, refs_total, label)``. The total
-    matches ``len(reference_models)`` so listeners can render a status-bar
-    progress like ``MOA: 2/3 refs done``. Best-effort — failures are logged
-    but never break the fan-out (display must never block a turn).
+    completes: ``progress_callback(refs_done, refs_total, label,
+    status="done"|"failed")``. The total matches ``len(reference_models)`` so
+    listeners can render a status-bar progress like ``MOA: 2/3 refs done``.
+    Best-effort — failures are logged but never break the fan-out (display must
+    never block a turn).
 
     Each element is ``(label, text, accounting)`` where accounting is a
     ``_RefAccounting`` object (zeroed for skipped/failed/interrupted
@@ -795,6 +796,29 @@ def _run_references_parallel(
     # instead of re-probing metadata sources per reference (dict get/set is
     # GIL-atomic; a rare duplicate probe on a first-use race is harmless).
     _ctx_len_cache: dict[tuple[str, str], int | None] = {}
+
+    def _notify_progress(idx: int) -> None:
+        nonlocal completed
+        completed += 1
+        if progress_callback is None:
+            return
+        try:
+            label = _slot_label(reference_models[idx])
+            result = results[idx]
+            status = (
+                "failed"
+                if result is not None and _is_failed_reference(result[1])
+                else "done"
+            )
+            progress_callback(
+                completed,
+                total,
+                label,
+                status=status,
+            )
+        except Exception as exc:  # pragma: no cover - display must never break
+            logger.debug("MoA progress_callback failed: %s", exc)
+
     try:
         for idx, slot in enumerate(reference_models):
             if slot.get("provider") == "moa":
@@ -816,6 +840,13 @@ def _run_references_parallel(
                 )
             ] = idx
 
+        # Recursion-guarded slots are already complete without a future.  Count
+        # and surface them as failed so the visible N/M state cannot remain
+        # short of the configured total.
+        for idx, result in enumerate(results):
+            if result is not None:
+                _notify_progress(idx)
+
         # Collect every reference before returning — the aggregator needs the
         # complete set, so there is no early-exit / first-completed path
         # here, other than a user interrupt. Progress callbacks fire as each
@@ -826,13 +857,7 @@ def _run_references_parallel(
             for future in done:
                 idx = futures[future]
                 results[idx] = future.result()
-                completed += 1
-                if progress_callback is not None:
-                    try:
-                        label = _slot_label(reference_models[idx])
-                        progress_callback(completed, total, label)
-                    except Exception as exc:  # pragma: no cover - display must never break
-                        logger.debug("MoA progress_callback failed: %s", exc)
+                _notify_progress(idx)
             if not pending:
                 break
             if agent is not None and getattr(agent, "_interrupt_requested", False):
@@ -882,6 +907,7 @@ def _run_references_parallel(
                                     _label,
                                 )
                         future.add_done_callback(_record_late)
+                _notify_progress(idx)
     finally:
         executor.shutdown(wait=not interrupted, cancel_futures=interrupted)
 
@@ -1351,10 +1377,9 @@ class MoAChatCompletions:
         #                       (fired once per reference completion — drives
         #                        status-bar progress like ``MOA: 2/3 refs done``)
         #   "moa.phase"       kwargs: phase, refs_done, refs_total, aggregator
-        #                       (fired on phase transitions, currently
-        #                        phase="aggregator" right before the aggregator
-        #                        acts; phase="reference" mirrors ``moa.progress``
-        #                        so listeners can rely on a single event family)
+        #                       (phase="reference" fires before fan-out with
+        #                        0/N and labels; phase="aggregator" fires after
+        #                        fan-out, right before the aggregator acts)
         #   "moa.aggregating" kwargs: aggregator (label), ref_count
         # Never raises into the model call — display is best-effort.
         self.reference_callback = reference_callback
@@ -1817,12 +1842,36 @@ class MoAChatCompletions:
             # each reference completes. The callback is bound to self so it
             # goes through the same display hook as the existing
             # ``moa.reference`` / ``moa.aggregating`` events.
-            def _progress(done: int, total: int, label: str) -> None:
+            reference_labels = [
+                _slot_label(slot) for slot in reference_models
+            ]
+            if reference_labels:
+                # Emit the initial 0/N state before the blocking fan-out.  The
+                # previous lifecycle stayed silent until the first reference
+                # completed, which could leave messaging cards looking stuck
+                # for minutes on a slow advisor.
+                self._emit(
+                    "moa.phase",
+                    phase="reference",
+                    refs_done=0,
+                    refs_total=len(reference_labels),
+                    reference_labels=reference_labels,
+                    aggregator=_slot_label(aggregator),
+                )
+
+            def _progress(
+                done: int,
+                total: int,
+                label: str,
+                *,
+                status: str = "done",
+            ) -> None:
                 self._emit(
                     "moa.progress",
                     refs_done=done,
                     refs_total=total,
                     label=label,
+                    status=status,
                 )
 
             reference_outputs = _run_references_parallel(
@@ -2091,6 +2140,7 @@ def build_moa_facade(agent, preset_name: Any = None) -> MoAClient:
                     None,
                     moa_refs_done=kwargs.get("refs_done"),
                     moa_refs_total=kwargs.get("refs_total"),
+                    moa_status=kwargs.get("status"),
                 )
             elif event == "moa.phase":
                 # Phase transition (currently only ``phase="aggregator"``
@@ -2104,6 +2154,7 @@ def build_moa_facade(agent, preset_name: Any = None) -> MoAClient:
                     moa_phase=kwargs.get("phase"),
                     moa_refs_done=kwargs.get("refs_done"),
                     moa_refs_total=kwargs.get("refs_total"),
+                    moa_reference_labels=kwargs.get("reference_labels"),
                 )
             elif event == "moa.aggregating":
                 cb(

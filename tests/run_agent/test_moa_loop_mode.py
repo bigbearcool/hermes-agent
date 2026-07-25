@@ -206,13 +206,44 @@ moa:
     completions._emit(
         "moa.reference", index=0, count=1, label="openai-codex/gpt-5.5", text="advice"
     )
+    completions._emit(
+        "moa.phase",
+        phase="reference",
+        refs_done=0,
+        refs_total=1,
+        reference_labels=["openai-codex/gpt-5.5"],
+        aggregator="openrouter",
+    )
+    completions._emit(
+        "moa.progress",
+        refs_done=1,
+        refs_total=1,
+        label="openai-codex/gpt-5.5",
+        status="done",
+    )
     completions._emit("moa.aggregating", aggregator="openrouter", ref_count=1)
 
-    assert [e[0] for e in events] == ["moa.reference", "moa.aggregating"]
+    assert [e[0] for e in events] == [
+        "moa.reference",
+        "moa.phase",
+        "moa.progress",
+        "moa.aggregating",
+    ]
     ref_event = events[0]
     assert ref_event[1][0] == "openai-codex/gpt-5.5"
     assert ref_event[1][1] == "advice"
     assert ref_event[2] == {"moa_index": 0, "moa_count": 1}
+    assert events[1][2] == {
+        "moa_phase": "reference",
+        "moa_refs_done": 0,
+        "moa_refs_total": 1,
+        "moa_reference_labels": ["openai-codex/gpt-5.5"],
+    }
+    assert events[2][2] == {
+        "moa_refs_done": 1,
+        "moa_refs_total": 1,
+        "moa_status": "done",
+    }
 
 
 def test_moa_does_not_cap_output_tokens(monkeypatch, tmp_path):

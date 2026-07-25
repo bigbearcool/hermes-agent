@@ -7,9 +7,8 @@ complete and the phase transitions from ``reference`` to ``aggregator``:
   - ``moa.progress`` — fired once per reference completion with
                        ``refs_done`` and ``refs_total`` (e.g. drives a
                        status-bar ``MOA: 2/3 refs done`` indicator)
-  - ``moa.phase``    — fired once per phase transition (currently only the
-                       ``phase="aggregator"`` transition right before the
-                       aggregator acts)
+  - ``moa.phase``    — emits ``phase="reference"`` with 0/N before fan-out,
+                       then ``phase="aggregator"`` before synthesis
 
 These tests exercise the real callback surface end-to-end through the
 display hook (``reference_callback``) — no mocks on the dispatch path.
@@ -107,10 +106,40 @@ def test_moa_progress_fires_for_each_reference(moa_config, monkeypatch):
     for _, kwargs in progress_events:
         assert "label" in kwargs
         assert kwargs["label"]
+        assert kwargs["status"] == "done"
+
+
+def test_moa_progress_marks_failed_reference(moa_config, monkeypatch):
+    from agent.moa_loop import MoAChatCompletions
+
+    def fake_call_llm(**kwargs):
+        if (
+            kwargs.get("task") == "moa_reference"
+            and kwargs.get("model") == "openai/gpt-5.5"
+        ):
+            raise RuntimeError("advisor unavailable")
+        return _response("advice")
+
+    monkeypatch.setattr("agent.moa_loop.call_llm", fake_call_llm)
+
+    facade = MoAChatCompletions("closed")
+    captured = _collect_emits(facade)
+    facade.create(
+        model="closed",
+        messages=[{"role": "user", "content": "review"}],
+    )
+
+    status_by_label = {
+        kwargs["label"]: kwargs["status"]
+        for event, kwargs in captured
+        if event == "moa.progress"
+    }
+    assert status_by_label["openrouter:openai/gpt-5.5"] == "failed"
+    assert list(status_by_label.values()).count("done") == 2
 
 
 def test_moa_phase_transitions_to_aggregator(moa_config, monkeypatch):
-    """A single ``moa.phase`` event with ``phase="aggregator"`` fires after the fan-out."""
+    """Reference 0/N is visible before fan-out, then aggregation takes over."""
     from agent.moa_loop import MoAChatCompletions
 
     def fake_call_llm(**kwargs):
@@ -129,14 +158,18 @@ def test_moa_phase_transitions_to_aggregator(moa_config, monkeypatch):
     )
 
     phase_events = [(e, k) for (e, k) in captured if e == "moa.phase"]
-    # Exactly one phase event per turn, identifying the aggregator.
-    assert len(phase_events) == 1
-    _event, kwargs = phase_events[0]
-    assert kwargs["phase"] == "aggregator"
-    assert kwargs["aggregator"] == "openrouter:anthropic/claude-opus-4.8"
-    # counts match the configured reference count
-    assert kwargs["refs_done"] == 3
-    assert kwargs["refs_total"] == 3
+    assert [kwargs["phase"] for _, kwargs in phase_events] == [
+        "reference",
+        "aggregator",
+    ]
+    initial = phase_events[0][1]
+    assert initial["refs_done"] == 0
+    assert initial["refs_total"] == 3
+    assert len(initial["reference_labels"]) == 3
+    final = phase_events[1][1]
+    assert final["aggregator"] == "openrouter:anthropic/claude-opus-4.8"
+    assert final["refs_done"] == 3
+    assert final["refs_total"] == 3
 
 
 def test_moa_progress_counts_match_n_references(moa_config, monkeypatch):
@@ -168,12 +201,7 @@ def test_moa_progress_counts_match_n_references(moa_config, monkeypatch):
 
 
 def test_moa_progress_event_order_matches_fanout(moa_config, monkeypatch):
-    """Every progress event fires AFTER its matching moa.reference event.
-
-    Listeners that animate one block per reference (collapsible) need the
-    progress notification to land after the per-reference text so the
-    status-bar counter and the rendered block stay in lockstep.
-    """
+    """The initial phase precedes progress and aggregation follows references."""
     from agent.moa_loop import MoAChatCompletions
 
     def fake_call_llm(**kwargs):
@@ -191,24 +219,26 @@ def test_moa_progress_event_order_matches_fanout(moa_config, monkeypatch):
         messages=[{"role": "user", "content": "rank the options"}],
     )
 
-    # Walk the events; every progress event must be preceded by its reference
-    # text event (matching ``index``). The full sequence ends with the
-    # aggregator phase event.
-    seen_phase = False
-    for event, kwargs in captured:
-        if event == "moa.reference":
-            assert kwargs["index"] <= kwargs["count"]
-        elif event == "moa.progress":
-            assert kwargs["refs_done"] <= kwargs["refs_total"]
-        elif event == "moa.phase":
-            # No further reference events after the aggregator phase event.
-            assert kwargs["phase"] == "aggregator"
-            seen_phase = True
-        elif event == "moa.aggregating":
-            # Legacy marker still fires for backwards compatibility, and it
-            # always lands AFTER the phase event.
-            assert seen_phase
-    assert seen_phase, "expected at least one moa.phase event"
+    assert captured[0][0] == "moa.phase"
+    assert captured[0][1]["phase"] == "reference"
+    aggregator_phase_index = next(
+        index
+        for index, (event, kwargs) in enumerate(captured)
+        if event == "moa.phase" and kwargs["phase"] == "aggregator"
+    )
+    reference_indexes = [
+        index
+        for index, (event, _kwargs) in enumerate(captured)
+        if event == "moa.reference"
+    ]
+    assert reference_indexes
+    assert max(reference_indexes) < aggregator_phase_index
+    aggregating_index = next(
+        index
+        for index, (event, _kwargs) in enumerate(captured)
+        if event == "moa.aggregating"
+    )
+    assert aggregator_phase_index < aggregating_index
 
 
 def test_moa_progress_callback_none_safe(moa_config, monkeypatch):

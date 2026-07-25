@@ -314,6 +314,7 @@ class GatewayStreamConsumer:
         self._tool_records: list[dict[str, Any]] = []
         self._tool_records_by_id: dict[str, dict[str, Any]] = {}
         self._tool_pending_by_name: dict[str, list[str]] = {}
+        self._orchestration_status: dict[str, Any] | None = None
         self._draft_id: Optional[int] = None
         # Cumulative draft-frame failure count for this consumer.  After the
         # first failure we permanently disable drafts for the remainder of
@@ -390,11 +391,18 @@ class GatewayStreamConsumer:
         return self._unified_status_enabled
 
     def on_status(self, event: dict) -> bool:
-        """Queue a structured tool event for unified-card rendering."""
+        """Queue structured tool or orchestration status for unified rendering."""
         if not self._unified_status_enabled or not isinstance(event, dict):
             return False
         kind = str(event.get("event_type") or event.get("event") or "")
-        if kind not in {"tool.started", "tool.completed", "tool.failed"}:
+        if kind not in {
+            "tool.started",
+            "tool.completed",
+            "tool.failed",
+            "moa.progress",
+            "moa.phase",
+            "moa.aggregating",
+        }:
             return False
         if str(event.get("tool_name") or event.get("name") or "") == "_thinking":
             return False
@@ -403,6 +411,9 @@ class GatewayStreamConsumer:
 
     def _apply_status_event(self, event: dict) -> None:
         kind = str(event.get("event_type") or event.get("event") or "")
+        if kind.startswith("moa."):
+            self._apply_moa_status_event(kind, event)
+            return
         tool_name = str(event.get("tool_name") or event.get("name") or "tool")
         if kind == "tool.started":
             if not self._tool_status_running:
@@ -492,13 +503,154 @@ class GatewayStreamConsumer:
             }
             self._tool_status_done = self._tool_status_done[-100:]
 
+    @staticmethod
+    def _status_count(value: Any, default: int = 0) -> int:
+        try:
+            return max(0, int(value))
+        except (TypeError, ValueError):
+            return default
+
+    def _apply_moa_status_event(self, kind: str, event: dict) -> None:
+        """Fold MoA lifecycle events into one stable orchestration snapshot."""
+        phase = str(event.get("moa_phase") or event.get("phase") or "").strip()
+        refs_done = self._status_count(
+            event.get("moa_refs_done", event.get("refs_done")),
+        )
+        refs_total = self._status_count(
+            event.get("moa_refs_total", event.get("refs_total")),
+        )
+        label = str(event.get("tool_name") or event.get("name") or "").strip()
+
+        if self._orchestration_status is None:
+            self._orchestration_status = {
+                "kind": "moa",
+                "phase": "references",
+                "refs_done": 0,
+                "refs_total": refs_total,
+                "references": [],
+                "aggregator": "",
+            }
+        state = self._orchestration_status
+        references = state.setdefault("references", [])
+
+        if kind == "moa.phase" and phase == "reference":
+            raw_labels = event.get("moa_reference_labels")
+            if not isinstance(raw_labels, (list, tuple)):
+                raw_labels = event.get("reference_labels")
+            labels = [
+                str(item).strip()
+                for item in (raw_labels or [])
+                if str(item).strip()
+            ]
+            state.update(
+                {
+                    "phase": "references",
+                    "refs_done": refs_done,
+                    "refs_total": refs_total or len(labels),
+                    "references": [
+                        {"label": item, "status": "running"}
+                        for item in labels
+                    ],
+                    "aggregator": label,
+                }
+            )
+            return
+
+        if kind == "moa.progress":
+            status = str(event.get("moa_status") or "done").strip().lower()
+            if status not in {"done", "failed"}:
+                status = "done"
+            record = next(
+                (
+                    item
+                    for item in references
+                    if str(item.get("label") or "") == label
+                ),
+                None,
+            )
+            if record is None and label:
+                record = {"label": label, "status": status}
+                references.append(record)
+            elif record is not None:
+                record["status"] = status
+            state["phase"] = "references"
+            state["refs_done"] = refs_done
+            state["refs_total"] = refs_total or max(
+                len(references),
+                self._status_count(state.get("refs_total")),
+            )
+            return
+
+        if kind == "moa.phase" and phase == "aggregator":
+            state["refs_done"] = refs_done
+            state["refs_total"] = refs_total or self._status_count(
+                state.get("refs_total")
+            )
+            state["aggregator"] = label
+            for record in references:
+                if record.get("status") == "running":
+                    record["status"] = "done"
+            state["phase"] = (
+                "degraded_aggregating"
+                if any(
+                    record.get("status") == "failed"
+                    for record in references
+                )
+                else "aggregating"
+            )
+            return
+
+        if kind == "moa.aggregating":
+            state["phase"] = "aggregating"
+            state["aggregator"] = label or str(state.get("aggregator") or "")
+            ref_count = self._status_count(event.get("moa_ref_count"))
+            if ref_count:
+                state["refs_done"] = ref_count
+                state["refs_total"] = ref_count
+
+    def _complete_orchestration(self) -> None:
+        state = self._orchestration_status
+        if not isinstance(state, dict):
+            return
+        references = state.get("references") or []
+        for item in references:
+            if isinstance(item, dict) and item.get("status") == "running":
+                item["status"] = "failed"
+        failed = any(
+            isinstance(item, dict) and item.get("status") == "failed"
+            for item in references
+        )
+        state["phase"] = "degraded" if failed else "completed"
+
+    def _has_unified_status(self) -> bool:
+        return bool(
+            self._unified_status_enabled
+            and (
+                self._tool_status_running
+                or self._tool_status_done
+                or self._orchestration_status
+            )
+        )
+
     def _refresh_status_metadata(self) -> None:
         if self._unified_status_enabled:
-            self._streaming_metadata["__hermes_stream_status"] = {
+            status: dict[str, Any] = {
                 "running": list(self._tool_status_running.values()),
                 "done": list(self._tool_status_done),
                 "calls": [dict(item) for item in self._tool_records],
             }
+            if self._orchestration_status is not None:
+                status["orchestration"] = {
+                    **self._orchestration_status,
+                    "references": [
+                        dict(item)
+                        for item in self._orchestration_status.get(
+                            "references", []
+                        )
+                        if isinstance(item, dict)
+                    ],
+                }
+            self._streaming_metadata["__hermes_stream_status"] = status
 
     @property
     def already_sent(self) -> bool:
@@ -947,6 +1099,8 @@ class GatewayStreamConsumer:
                 # tag is not lost.
                 if got_done:
                     self._flush_think_buffer()
+                    self._complete_orchestration()
+                    self._refresh_status_metadata()
 
                     # Intentional-silence suppression.  When the agent chose
                     # not to reply it emits a bare control marker (NO_REPLY /
@@ -1006,10 +1160,7 @@ class GatewayStreamConsumer:
                     )
                 ):
                     should_edit = False
-                has_unified_status = bool(
-                    self._unified_status_enabled
-                    and (self._tool_status_running or self._tool_status_done)
-                )
+                has_unified_status = self._has_unified_status()
                 if should_edit and (self._accumulated or has_unified_status):
                     # Split overflow: if accumulated text exceeds the platform
                     # limit, split into properly sized chunks.
@@ -2187,10 +2338,7 @@ class GatewayStreamConsumer:
         if self.cfg.cursor:
             visible_without_cursor = visible_without_cursor.replace(self.cfg.cursor, "")
         _visible_stripped = visible_without_cursor.strip()
-        has_unified_status = bool(
-            self._unified_status_enabled
-            and (self._tool_status_running or self._tool_status_done)
-        )
+        has_unified_status = self._has_unified_status()
         if not _visible_stripped and not has_unified_status:
             return True  # cursor-only / whitespace-only update
         if not text.strip() and not has_unified_status:

@@ -682,6 +682,73 @@ class TestFeishuAdapterMessaging(unittest.TestCase):
             )
         )
 
+    def test_cardkit_renders_moa_progress_and_separate_final_trace(self):
+        from plugins.platforms.feishu.adapter import FeishuAdapter
+
+        status = {
+            "running": ["⏳ Tool running: `read_file`"],
+            "done": [],
+            "calls": [
+                {
+                    "id": "call_1",
+                    "round": 1,
+                    "name": "read_file",
+                    "status": "running",
+                }
+            ],
+            "orchestration": {
+                "kind": "moa",
+                "phase": "degraded_aggregating",
+                "refs_done": 2,
+                "refs_total": 2,
+                "references": [
+                    {"label": "deepseek", "status": "done"},
+                    {"label": "grok", "status": "failed"},
+                ],
+                "aggregator": "gpt-5.6-terra",
+            },
+        }
+
+        streaming = FeishuAdapter._compose_unified_stream_content(
+            "正在形成答案",
+            {"__hermes_stream_status": status},
+        )
+        self.assertIn("部分参考模型不可用，正在降级综合", streaming)
+        self.assertIn("✅ `deepseek`", streaming)
+        self.assertIn("⚠️ `grok`", streaming)
+        self.assertIn("🧩 正在综合：`gpt-5.6-terra`", streaming)
+        self.assertIn("工具调用 · 第 1 轮", streaming)
+
+        status["orchestration"]["phase"] = "degraded"
+        status["calls"][0]["status"] = "done"
+        status["running"] = []
+        status["done"] = ["✅ Tool done: `read_file`"]
+        final = FeishuAdapter._build_final_cardkit_card(
+            "最终答案",
+            tool_status=status,
+        )
+        panels = [
+            item
+            for item in final["body"]["elements"]
+            if item.get("tag") == "collapsible_panel"
+        ]
+        self.assertEqual(
+            [item["element_id"] for item in panels],
+            ["moa_trace", "tool_trace"],
+        )
+        self.assertIn(
+            "MoA 协作记录（2）",
+            panels[0]["header"]["title"]["content"],
+        )
+        self.assertIn(
+            "部分参考模型不可用，已降级综合",
+            panels[0]["elements"][0]["content"],
+        )
+        self.assertIn(
+            "工具调用记录（1）",
+            panels[1]["header"]["title"]["content"],
+        )
+
     def test_cardkit_initial_stream_failure_replaces_reference_message_in_place(self):
         from gateway.config import PlatformConfig
         from plugins.platforms.feishu.adapter import FeishuAdapter

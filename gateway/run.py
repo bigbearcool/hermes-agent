@@ -21536,6 +21536,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     needs_progress_queue
                     or log_mode_enabled
                     or _live_status_adapter is not None
+                    or (
+                        _stream_consumer is not None
+                        and _stream_consumer.unified_status_enabled
+                    )
                 )
                 else None
             )

@@ -77,6 +77,99 @@ class TestUnifiedStreamingCard:
         assert adapter.edit_message.await_args.kwargs["finalize"] is True
 
     @pytest.mark.asyncio
+    async def test_moa_lifecycle_updates_and_finalizes_one_card(self):
+        adapter = self._adapter()
+        consumer = GatewayStreamConsumer(
+            adapter,
+            "oc_chat",
+            StreamConsumerConfig(edit_interval=0, buffer_threshold=1),
+        )
+
+        events = [
+            {
+                "event_type": "moa.phase",
+                "moa_phase": "reference",
+                "moa_refs_done": 0,
+                "moa_refs_total": 2,
+                "moa_reference_labels": ["deepseek", "grok"],
+                "tool_name": "gpt-5.6-terra",
+            },
+            {
+                "event_type": "moa.progress",
+                "tool_name": "deepseek",
+                "moa_refs_done": 1,
+                "moa_refs_total": 2,
+                "moa_status": "done",
+            },
+            {
+                "event_type": "moa.progress",
+                "tool_name": "grok",
+                "moa_refs_done": 2,
+                "moa_refs_total": 2,
+                "moa_status": "done",
+            },
+            {
+                "event_type": "moa.phase",
+                "tool_name": "gpt-5.6-terra",
+                "moa_phase": "aggregator",
+                "moa_refs_done": 2,
+                "moa_refs_total": 2,
+            },
+        ]
+        for event in events:
+            assert consumer.on_status(event)
+        consumer.on_delta("最终答案")
+        consumer.finish()
+        await consumer.run()
+
+        adapter.send.assert_awaited_once()
+        final_call = adapter.edit_message.await_args_list[-1]
+        assert final_call.kwargs["finalize"] is True
+        orchestration = final_call.kwargs["metadata"][
+            "__hermes_stream_status"
+        ]["orchestration"]
+        assert orchestration["phase"] == "completed"
+        assert orchestration["aggregator"] == "gpt-5.6-terra"
+        assert orchestration["references"] == [
+            {"label": "deepseek", "status": "done"},
+            {"label": "grok", "status": "done"},
+        ]
+
+    def test_moa_reference_failure_marks_final_state_degraded(self):
+        consumer = GatewayStreamConsumer(
+            self._adapter(),
+            "oc_chat",
+            StreamConsumerConfig(edit_interval=0, buffer_threshold=1),
+        )
+        consumer._apply_status_event(
+            {
+                "event_type": "moa.phase",
+                "moa_phase": "reference",
+                "moa_refs_total": 1,
+                "moa_reference_labels": ["grok"],
+            }
+        )
+        consumer._apply_status_event(
+            {
+                "event_type": "moa.progress",
+                "tool_name": "grok",
+                "moa_refs_done": 1,
+                "moa_refs_total": 1,
+                "moa_status": "failed",
+            }
+        )
+        consumer._complete_orchestration()
+        consumer._refresh_status_metadata()
+
+        orchestration = consumer._streaming_metadata[
+            "__hermes_stream_status"
+        ]["orchestration"]
+        assert orchestration["phase"] == "degraded"
+        assert orchestration["references"] == [
+            {"label": "grok", "status": "failed"}
+        ]
+
+    @pytest.mark.asyncio
     async def test_commentary_status_and_final_share_one_message(self):
         adapter = self._adapter()
         consumer = GatewayStreamConsumer(

@@ -1757,6 +1757,92 @@ class FeishuAdapter(BasePlatformAdapter):
             records.append(record)
         return records[-100:]
 
+    @staticmethod
+    def _unified_stream_orchestration(
+        status: Optional[Dict[str, Any]],
+    ) -> Optional[Dict[str, Any]]:
+        if not isinstance(status, dict):
+            return None
+        orchestration = status.get("orchestration")
+        if (
+            not isinstance(orchestration, dict)
+            or orchestration.get("kind") != "moa"
+        ):
+            return None
+        references: List[Dict[str, str]] = []
+        for item in orchestration.get("references", []):
+            if not isinstance(item, dict):
+                continue
+            label = str(item.get("label") or "").strip()
+            if not label:
+                continue
+            state = str(item.get("status") or "running").strip().lower()
+            if state not in {"running", "done", "failed"}:
+                state = "running"
+            references.append({"label": label, "status": state})
+        try:
+            refs_done = max(0, int(orchestration.get("refs_done") or 0))
+        except (TypeError, ValueError):
+            refs_done = 0
+        try:
+            refs_total = max(0, int(orchestration.get("refs_total") or 0))
+        except (TypeError, ValueError):
+            refs_total = 0
+        return {
+            "phase": str(orchestration.get("phase") or "references"),
+            "refs_done": refs_done,
+            "refs_total": refs_total or len(references),
+            "references": references,
+            "aggregator": str(orchestration.get("aggregator") or "").strip(),
+        }
+
+    @classmethod
+    def _format_moa_orchestration(
+        cls,
+        status: Optional[Dict[str, Any]],
+        *,
+        streaming: bool,
+    ) -> str:
+        orchestration = cls._unified_stream_orchestration(status)
+        if orchestration is None:
+            return ""
+        phase = orchestration["phase"]
+        refs_done = orchestration["refs_done"]
+        refs_total = orchestration["refs_total"]
+        references = orchestration["references"]
+        aggregator = orchestration["aggregator"]
+
+        if streaming and phase == "references":
+            heading = (
+                f"**MoA 协作 · 参考分析 {refs_done}/{refs_total}**"
+                if refs_total
+                else "**MoA 协作 · 参考分析**"
+            )
+        elif streaming and phase == "aggregating":
+            heading = "**MoA 协作 · 正在综合参考意见**"
+        elif streaming and phase == "degraded_aggregating":
+            heading = "**部分参考模型不可用，正在降级综合**"
+        elif phase == "degraded":
+            heading = "**部分参考模型不可用，已降级综合**"
+        else:
+            heading = "**MoA 协作已完成**"
+
+        lines = [heading]
+        icons = {"running": "⏳", "done": "✅", "failed": "⚠️"}
+        for reference in references:
+            lines.append(
+                f"{icons[reference['status']]} `{reference['label']}`"
+            )
+        if aggregator and phase != "references":
+            prefix = (
+                "🧩 正在综合"
+                if streaming
+                and phase in {"aggregating", "degraded_aggregating"}
+                else "🧩 综合模型"
+            )
+            lines.append(f"{prefix}：`{aggregator}`")
+        return "\n".join(lines)
+
     @classmethod
     def _format_tool_call_rounds(
         cls,
@@ -1808,10 +1894,15 @@ class FeishuAdapter(BasePlatformAdapter):
         if not isinstance(metadata, dict):
             return content
         status = metadata.get("__hermes_stream_status")
-        progress_section = cls._format_tool_call_rounds(
-            status,
-            streaming=True,
-        )
+        progress_sections = [
+            section
+            for section in (
+                cls._format_moa_orchestration(status, streaming=True),
+                cls._format_tool_call_rounds(status, streaming=True),
+            )
+            if section
+        ]
+        progress_section = "\n\n".join(progress_sections)
         if not progress_section:
             return content or ""
         if not content:
@@ -1853,6 +1944,39 @@ class FeishuAdapter(BasePlatformAdapter):
                 start=1,
             )
         ]
+        orchestration = cls._unified_stream_orchestration(tool_status)
+        moa_log = cls._format_moa_orchestration(
+            tool_status,
+            streaming=False,
+        )
+        if orchestration is not None and moa_log:
+            ref_count = (
+                len(orchestration["references"])
+                or orchestration["refs_total"]
+            )
+            elements.append(
+                {
+                    "tag": "collapsible_panel",
+                    "element_id": "moa_trace",
+                    "expanded": False,
+                    "direction": "vertical",
+                    "background_color": "grey",
+                    "header": {
+                        "title": {
+                            "tag": "markdown",
+                            "content": f"**MoA 协作记录（{ref_count}）**",
+                        }
+                    },
+                    "elements": [
+                        {
+                            "tag": "markdown",
+                            "content": moa_log,
+                            "text_size": "notation",
+                            "element_id": "moa_log",
+                        }
+                    ],
+                }
+            )
         tool_records = cls._unified_stream_call_records(tool_status)
         tool_log = cls._format_tool_call_rounds(
             tool_status,
