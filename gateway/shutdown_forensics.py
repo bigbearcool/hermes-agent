@@ -239,6 +239,15 @@ def spawn_async_diagnostic(
         "dmesg -T 2>/dev/null | tail -20 || journalctl --user -n 20 --no-pager 2>/dev/null | tail -20 || true; "
         "echo '=== end ==='"
     )
+    child_code = (
+        "import subprocess, sys\n"
+        "try:\n"
+        "    subprocess.run("
+        "['bash', '-c', sys.argv[2]], timeout=float(sys.argv[1]), check=False"
+        ")\n"
+        "except subprocess.TimeoutExpired:\n"
+        "    pass\n"
+    )
 
     try:
         # Open the log file in append mode and let the subprocess inherit.
@@ -255,7 +264,13 @@ def spawn_async_diagnostic(
         # start_new_session, a SIGKILL on our cgroup takes the diag down
         # before it can flush.
         proc = subprocess.Popen(
-            ["timeout", f"{timeout_seconds:.0f}", "bash", "-c", script],
+            [
+                sys.executable,
+                "-c",
+                child_code,
+                str(timeout_seconds),
+                script,
+            ],
             stdout=fd,
             stderr=subprocess.STDOUT,
             stdin=subprocess.DEVNULL,

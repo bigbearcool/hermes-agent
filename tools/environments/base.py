@@ -382,6 +382,71 @@ def _cwd_marker(session_id: str) -> str:
     return f"__HERMES_CWD_{session_id}__"
 
 
+# Per-session variables that the gateway bridges freshly onto every command's
+# process environment (via tools/environments/local._inject_session_context_env,
+# reading gateway.session_context._VAR_MAP). They must NEVER be persisted into
+# the shared bash session snapshot: a single long-lived backend serves many
+# concurrent sessions (the messaging gateway, TUI, desktop/web dashboard all
+# collapse the terminal to one "default" environment), so ``export -p`` dumping
+# the FIRST session's HERMES_SESSION_ID into the snapshot makes every LATER
+# session ``source`` that stale value and see a FOREIGN session's identity —
+# overriding the correct per-command Popen env (issue: cross-session
+# HERMES_SESSION_ID leak via the shared snapshot). Stripping them from the
+# snapshot is safe because they are re-injected on every command; a snapshot
+# should only carry the user's own shell state (PATH, functions, exports they
+# set), not Hermes' per-turn session identity.
+#
+# Kept in sync with gateway.session_context._VAR_MAP: every bridged name starts
+# with one of these prefixes (or is HERMES_UI_SESSION_ID). Used by unit tests
+# as the Python-side contract for the exclusion set; the dump path unsets by
+# name/prefix instead of grepping declare lines (see below / issue #71296).
+_SNAPSHOT_EXCLUDED_ENV_REGEX = (
+    "^declare -x (HERMES_SESSION_|HERMES_UI_SESSION_ID|HERMES_CRON_AUTO_DELIVER_)"
+)
+
+# Bash 4+ exposes BASHPID, which is unique in ``&``-launched subshells.
+# macOS still ships Bash 3.2, where BASHPID is empty and ``$$`` remains the
+# parent PID in those subshells. Cache a high-entropy fallback per writer so
+# every expansion within one writer is stable while concurrent writers do not
+# collide.
+_SNAPSHOT_WRITER_ID = (
+    "${BASHPID:-${__hermes_snap_id:=$$.$RANDOM.$RANDOM}}"
+)
+
+
+def _export_dump_excluding_session_vars(tmp_path: str) -> str:
+    """Return a shell snippet that dumps ``export -p`` to *tmp_path* minus the
+    per-session bridged vars (see ``_SNAPSHOT_EXCLUDED_ENV_REGEX``).
+
+    Unset the bridged vars in a subshell *before* ``export -p``. A line-based
+    ``grep -vE`` filter is unsafe: bash 3.2 prints a value containing a newline
+    as a multi-line ``declare -x NAME="…`` block, so only the opener matches the
+    regex and continuation lines (e.g. ``curl … | bash #`` smuggled into a
+    Matrix room/display name via ``HERMES_SESSION_CHAT_NAME``) land in the
+    snapshot and execute on the next ``source`` (issue #71296). Unsetting first
+    means ``export -p`` never emits those vars — including any continuation
+    lines. ``|| true`` keeps the success contract for callers that chain on it.
+
+    The dump MUST be wrapped in a brace group with the redirection applied to
+    the group. *tmp_path* typically embeds the portable writer id for
+    concurrency-safe temp names; a redirection attached to a pipeline segment
+    would expand that id inside the segment's subshell (a different writer
+    than the parent that expands the follow-up ``mv``), silently orphaning the dump.
+    The brace-group redirect is expanded in the current shell, keeping both
+    expansions consistent.
+    """
+    # ${!PREFIX*} is bash 3.2+ name-prefix expansion; empty matches are fine
+    # because ``unset`` with only missing names is ignored under 2>/dev/null.
+    return (
+        "{ ( "
+        "unset ${!HERMES_SESSION_*} ${!HERMES_CRON_AUTO_DELIVER_*} "
+        "HERMES_UI_SESSION_ID 2>/dev/null; "
+        "export -p; "
+        ") || true; } "
+        f"> {tmp_path}"
+    )
+
+
 # ---------------------------------------------------------------------------
 # BaseEnvironment
 # ---------------------------------------------------------------------------
@@ -491,14 +556,17 @@ class BaseEnvironment(ABC):
         # calls run) ``$$`` stays the *parent* shell's PID — so two concurrent
         # writers would pick the SAME temp name, clobber each other's temp
         # mid-write, and mv would then publish a torn file (the corruption is
-        # only narrowed, not closed).  ``$BASHPID`` is the actual subshell PID
-        # and is genuinely unique per writer, which closes the race.  The
+        # only narrowed, not closed).  The portable writer id uses BASHPID
+        # where available and a cached random fallback on macOS Bash 3.2. The
         # static path is shell-quoted (Windows/Git-Bash drive letters, spaces)
-        # with ``$BASHPID`` left outside the quotes so it still expands.
-        _snap_tmp = self._quote_shell_path(self._snapshot_path + ".tmp.") + "$BASHPID"
+        # with the writer id left outside the quotes so it still expands.
+        _snap_tmp = (
+            self._quote_shell_path(self._snapshot_path + ".tmp.")
+            + _SNAPSHOT_WRITER_ID
+        )
         bootstrap = (
             f"umask 077\n"
-            f"export -p > {_snap_tmp}\n"
+            f"{_export_dump_excluding_session_vars(_snap_tmp)}\n"
             # Dump function definitions, filtering out private (``_``-prefixed)
             # helpers — mainly bash-completion internals (``_git``, ``_make``…)
             # — by NAME, not by line.  A naive ``declare -f | grep -vE '^_[^_]'``
@@ -606,11 +674,14 @@ class BaseEnvironment(ABC):
         # Use atomic file replacement for env snapshot updates (issue #38249).
         # Assemble into a per-writer-unique temp file, then mv to atomically
         # replace the snapshot so concurrent source() calls never read a
-        # truncated/half-written file.  ``$BASHPID`` (not ``$$``) is the actual
-        # subshell PID — unique per concurrent ``&``-launched writer — so two
+        # truncated/half-written file. The portable writer id stays unique per
+        # concurrent ``&``-launched writer, including under macOS Bash 3.2, so
         # writers never share a temp name and clobber each other before the mv.
-        # Static path shell-quoted (Windows/spaces); ``$BASHPID`` left to expand.
-        _snap_tmp = self._quote_shell_path(self._snapshot_path + ".tmp.") + "$BASHPID"
+        # Static path is shell-quoted (Windows/spaces); writer id stays expandable.
+        _snap_tmp = (
+            self._quote_shell_path(self._snapshot_path + ".tmp.")
+            + _SNAPSHOT_WRITER_ID
+        )
 
         parts = []
 
@@ -642,9 +713,15 @@ class BaseEnvironment(ABC):
         # Chain mv on the export succeeding so a failed/partial dump never
         # replaces a good snapshot; drop the temp on failure so it isn't
         # orphaned (cleaned up wholesale in LocalEnvironment.cleanup too).
+        # NOTE: the redirection must be attached to a brace group — ``_snap_tmp``
+        # embeds the writer id, and a redirect on a pipeline segment expands
+        # inside that segment's subshell (a different writer than the parent
+        # that expands the ``mv`` operand), silently orphaning the dump. See
+        # _export_dump_excluding_session_vars.
         if self._snapshot_ready:
             parts.append(
-                f"{{ export -p > {_snap_tmp} && mv -f {_snap_tmp} {_quoted_snap}; }} "
+                f"{{ {_export_dump_excluding_session_vars(_snap_tmp)} "
+                f"&& mv -f {_snap_tmp} {_quoted_snap}; }} "
                 f"2>/dev/null || rm -f {_snap_tmp} 2>/dev/null || true"
             )
 

@@ -4,6 +4,7 @@ import os
 import shlex
 import shutil
 import subprocess
+import sys
 import time
 
 import pytest
@@ -42,6 +43,10 @@ def test_real_read_tool_binaries_confirm_option_ownership(
         ("man", ["--pager", "-payload-marker", "ls"], None, True),
         ("man", ["-P", "-payload-marker", "ls"], None, True),
     ],
+)
+@pytest.mark.skipif(
+    not sys.platform.startswith("linux"),
+    reason="real-binary option grammar and script(1) flags are GNU/Linux-specific",
 )
 def test_real_binaries_execute_leading_dash_program_payload(
     tmp_path, tool, args, stdin, needs_tty

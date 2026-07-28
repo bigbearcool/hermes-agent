@@ -29,6 +29,7 @@ from agent.lsp.client import LSPClient
 
 
 MOCK_SERVER = str(Path(__file__).parent / "_mock_lsp_server.py")
+pytestmark = pytest.mark.live_system_guard_bypass
 
 
 def _client(workspace: Path, script: str, **env_extra: str) -> LSPClient:
