@@ -46,15 +46,28 @@ from hermes_state import SessionDB
 
 
 @pytest.fixture()
-def mock_manager():
+def mock_manager(tmp_path):
     """SessionManager with a mock agent factory."""
-    return SessionManager(agent_factory=lambda: MagicMock(name="MockAIAgent"))
+    return SessionManager(
+        agent_factory=lambda: MagicMock(name="MockAIAgent"),
+        db=SessionDB(db_path=tmp_path / "state.db"),
+    )
 
 
 @pytest.fixture()
 def agent(mock_manager):
     """HermesACPAgent backed by a mock session manager."""
     return HermesACPAgent(session_manager=mock_manager)
+
+
+@pytest.fixture(autouse=True)
+def disable_real_auto_title(monkeypatch):
+    """Keep prompt tests hermetic unless they explicitly mock title dispatch."""
+    monkeypatch.setattr("agent.title_generator._auto_title_enabled", lambda: False)
+    monkeypatch.setattr(
+        "hermes_cli.inventory.build_models_payload",
+        lambda *_args, **_kwargs: {"providers": []},
+    )
 
 
 @pytest.mark.asyncio
