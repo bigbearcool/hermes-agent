@@ -271,6 +271,22 @@ def test_prompt_submit_dispatches_to_compute_host_when_turn_isolation_enabled(mo
         server._sessions.pop("iso-sid", None)
 
 
+def test_compute_host_explicit_images_do_not_clear_later_attachment(monkeypatch):
+    class _Supervisor:
+        def submit_turn(self, _frame, *, on_complete=None):
+            session["attached_images"].append("/tmp/c.png")
+
+    session = _session(attached_images=[])
+    monkeypatch.setattr(server, "_get_compute_host_supervisor", lambda _cfg=None: _Supervisor())
+
+    response = server._submit_prompt_to_compute_host(
+        "r1", "sid", session, "B", image_paths=["/tmp/b.png"]
+    )
+
+    assert response["result"]["status"] == "streaming"
+    assert session["attached_images"] == ["/tmp/c.png"]
+
+
 def test_prompt_submit_fails_open_inline_when_compute_host_dispatch_breaks(monkeypatch):
     class _BrokenSupervisor:
         def submit_turn(self, frame, *, on_complete=None):
@@ -374,7 +390,17 @@ def test_compute_host_turn_end_updates_metadata_mirror(monkeypatch):
         assert info["tools"] == {"core": ["terminal"]}
         assert info["usage"]["total"] == 140
         assert "credential_warning" not in info
-        assert emitted[-1] == ("session.info", "iso-sid", info)
+        event, sid, emitted_info = emitted[-1]
+        assert (event, sid) == ("session.info", "iso-sid")
+        # Runtime metadata such as update status can legitimately change
+        # between the callback's projection and this second _session_info()
+        # read.  Assert the compute-host mirror contract, not a snapshot of
+        # unrelated dynamic fields.
+        assert emitted_info["model"] == info["model"]
+        assert emitted_info["provider"] == info["provider"]
+        assert emitted_info["system_prompt"] == info["system_prompt"]
+        assert emitted_info["tools"] == info["tools"]
+        assert emitted_info["usage"] == info["usage"]
     finally:
         server._sessions.pop("iso-sid", None)
 
@@ -879,13 +905,15 @@ class _BrokenStdout:
         return None
 
 
-def test_write_json_serializes_concurrent_writes(monkeypatch):
+def test_write_json_serializes_concurrent_writes():
     out = _ChunkyStdout()
     isolated_transport = server.StdioTransport(lambda: out, threading.Lock())
-    monkeypatch.setattr(server, "_stdio_transport", isolated_transport)
 
     threads = [
-        threading.Thread(target=server.write_json, args=({"seq": i, "text": "x" * 24},))
+        threading.Thread(
+            target=isolated_transport.write,
+            args=({"seq": i, "text": "x" * 24},),
+        )
         for i in range(8)
     ]
 
@@ -900,13 +928,8 @@ def test_write_json_serializes_concurrent_writes(monkeypatch):
         frames = [json.loads(line) for line in lines]
     except json.JSONDecodeError as exc:
         pytest.fail(f"concurrent writes produced invalid JSON: {lines!r}; {exc}")
-    test_frames = [frame for frame in frames if "seq" in frame]
-
-    # Earlier tests may still have a legitimate background event in flight.
-    # Every line must remain valid JSON, while this test's eight frames must
-    # each appear exactly once and never interleave.
-    assert len(test_frames) == 8
-    assert {frame["seq"] for frame in test_frames} == set(range(8))
+    assert len(frames) == 8
+    assert {frame["seq"] for frame in frames} == set(range(8))
 
 
 def test_write_json_returns_false_on_broken_pipe(monkeypatch):
@@ -6135,6 +6158,94 @@ def test_complete_slash_reasoning_includes_current_efforts_and_global_scope():
     assert {"max", "ultra", "--global"} <= values
 
 
+_SLASH_FILLER_COUNT = 60
+
+
+def _slash_skill_fixtures(monkeypatch):
+    """Stub a skill install big enough that a flat cap would truncate it."""
+    filler = {f"/filler-{i:03d}": 0 for i in range(_SLASH_FILLER_COUNT)}
+    usage = {"work": 297, "research": 84, "clean": 12}
+
+    monkeypatch.setattr(
+        server,
+        "_skill_usage_lookup",
+        lambda: (
+            lambda name: usage.get(name, 0),
+            lambda name: "bundled" if name.startswith("unused-") else "local",
+        ),
+    )
+    monkeypatch.setattr(
+        "agent.skill_commands.get_skill_commands",
+        lambda: {
+            "/work": {"description": "Fresh worktree"},
+            "/research": {"description": "Look it up"},
+            "/clean": {"description": "Polish the diff"},
+            "/unused-bundled": {"description": "Shipped, never opened"},
+            **{cmd: {"description": "Filler"} for cmd in filler},
+        },
+    )
+    monkeypatch.setattr("agent.skill_bundles.get_skill_bundles", lambda: {})
+
+
+def _slash_completions(text: str) -> list[dict]:
+    resp = server.handle_request(
+        {"id": "1", "method": "complete.slash", "params": {"text": text}}
+    )
+    return resp["result"]["items"]
+
+
+def test_complete_slash_offers_skills_alongside_commands(monkeypatch):
+    """A bare `/` must reach the skills, not just the registry.
+
+    The completer emits every registry command before the first skill, so one
+    flat cap spent every row on commands and no skill was reachable at all.
+    """
+    _slash_skill_fixtures(monkeypatch)
+
+    kinds = {item["kind"] for item in _slash_completions("/")}
+
+    assert kinds == {"command", "skill"}
+
+
+def test_complete_slash_ranks_skills_by_recorded_usage(monkeypatch):
+    """The skills someone actually invokes lead the ones they never opened."""
+    _slash_skill_fixtures(monkeypatch)
+
+    skills = [
+        item["text"].strip() for item in _slash_completions("/") if item["kind"] == "skill"
+    ]
+
+    assert skills[:3] == ["work", "research", "clean"]
+
+
+def test_complete_slash_prunes_unused_builtins_only_while_browsing(monkeypatch):
+    """A bare `/` is browsing and may prune; a typed query is a search.
+
+    A search that hides a match is broken, so the never-opened bundled skill
+    disappears from `/` and comes straight back the moment it is typed for.
+    """
+    _slash_skill_fixtures(monkeypatch)
+
+    browsing = {item["text"].strip() for item in _slash_completions("/")}
+    searching = {item["text"].strip() for item in _slash_completions("/unused")}
+
+    assert "unused-bundled" not in browsing
+    assert "unused-bundled" in searching
+
+
+def test_complete_slash_leaves_argument_stages_alone(monkeypatch):
+    """Ranking applies to the command token, never to a command's own args.
+
+    `/details c` completes that command's modes; a skill named /clean also
+    starts with a `c` and must not be offered as one of them.
+    """
+    _slash_skill_fixtures(monkeypatch)
+
+    items = _slash_completions("/details c")
+
+    assert [item["text"] for item in items] == ["collapsed", "cycle"]
+
+
 def test_config_set_reasoning_updates_live_session_and_agent(tmp_path, monkeypatch):
     monkeypatch.setattr(server, "_hermes_home", tmp_path)
     (tmp_path / "config.yaml").write_text("agent:\n  reasoning_effort: medium\n", encoding="utf-8")
@@ -9042,6 +9153,7 @@ def test_interrupt_drops_queued_prompt_for_session():
         ),
         running=True,
         queued_prompt={"text": "next prompt", "transport": None},
+        queued_prompts=[{"text": "later prompt", "image_paths": ["/tmp/later.png"], "transport": None}],
         _run_thread=_LiveThread(),
     )
     server._sessions["sid"] = session
@@ -9054,6 +9166,7 @@ def test_interrupt_drops_queued_prompt_for_session():
         assert resp.get("result"), f"got error: {resp.get('error')}"
         assert calls["interrupted"] is True
         assert session.get("queued_prompt") is None
+        assert session.get("queued_prompts") is None
     finally:
         server._sessions.pop("sid", None)
 

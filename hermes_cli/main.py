@@ -5036,6 +5036,7 @@ from hermes_cli.update_cmd import (  # noqa: F401
     _invalidate_update_cache,
     _is_android_python,
     _is_fork,
+    _leftover_pausable_gateway_pids,
     _log_only_write,
     _npm_bin_exists,
     _npm_lockfile_changed,
@@ -5063,7 +5064,9 @@ from hermes_cli.update_cmd import (  # noqa: F401
     _update_via_zip,
     _upgrade_pip_before_lazy_refresh,
     _validate_critical_files_syntax,
+    _validate_critical_modules_import,
     _venv_core_imports_healthy,
+    _venv_launcher_ancestors,
     _wait_for_windows_update_gateway_exit,
     _warn_incomplete_gateway_fleet_restart,
     _web_build_toolchain_ready,
@@ -5074,6 +5077,7 @@ from hermes_cli.update_cmd import (  # noqa: F401
     _write_update_planned_stop_marker,
     _UPDATE_RUNTIME_RELOAD_MODULES,
     _UPDATE_CRITICAL_FILES,
+    _UPDATE_CRITICAL_MODULES,
     OFFICIAL_REPO_URLS,
     _PRE_UPDATE_SNAPSHOT_KEEP,
     _PRE_UPDATE_SNAPSHOT_MAX_FILE_SIZE,
@@ -7950,7 +7954,9 @@ def _venv_scripts_dir() -> Path | None:
     venv_dir = PROJECT_ROOT / "venv"
     if not venv_dir.is_dir():
         return None
-    scripts = venv_dir / ("Scripts" if _is_windows() else "bin")
+    from hermes_constants import venv_bin_dir
+
+    scripts = venv_bin_dir(venv_dir, windows=_is_windows())
     return scripts if scripts.is_dir() else None
 
 
@@ -8743,9 +8749,10 @@ def _resolve_install_target_python(
     ``importlib.metadata`` queries the right site-packages.
     """
     if env and "VIRTUAL_ENV" in env:
+        from hermes_constants import venv_python_path
+
         venv_root = Path(env["VIRTUAL_ENV"])
-        scripts = venv_root / ("Scripts" if _is_windows() else "bin")
-        candidate = scripts / ("python.exe" if _is_windows() else "python")
+        candidate = venv_python_path(venv_root, windows=_is_windows())
         if candidate.exists():
             return candidate
 

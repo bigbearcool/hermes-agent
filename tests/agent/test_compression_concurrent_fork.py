@@ -78,6 +78,12 @@ def _build_agent_with_db(db: SessionDB, session_id: str):
     compressor._last_aux_model_failure_model = None
     compressor._last_aux_model_failure_error = None
     agent.context_compressor = compressor
+    # The lock tests replace the real compressor with a deterministic mock, so
+    # the auxiliary-provider feasibility probe is outside their contract.  If
+    # left enabled, the worker can spend several seconds probing configured
+    # providers before it reaches ``compress()``, making the fence timing test
+    # exercise provider availability instead of the compression lock.
+    agent._compression_feasibility_checked = True
     # These tests cover the ROTATION fallback path (forking, child sessions,
     # lock contention) — pin in_place=False so they keep exercising it
     # regardless of the global default (which flipped to True in #38763).
