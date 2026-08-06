@@ -1512,6 +1512,7 @@ class FeishuAdapter(BasePlatformAdapter):
     _CARDKIT_MESSAGE_PREFIX = "cardkit:"
     _CARDKIT_STREAM_ELEMENT_ID = "streaming_content"
     _CARDKIT_FLUSH_TIMEOUT_SECONDS = 5.0
+    _CARDKIT_STATE_CACHE_SIZE = 512
     _CARDKIT_INITIAL_CONTENT = ""
     _CARDKIT_LOADING_ICON_KEY = (
         "img_v3_02vb_496bec09-4b43-4773-ad6b-0cdd103cd2bg"
@@ -1538,6 +1539,7 @@ class FeishuAdapter(BasePlatformAdapter):
         )
         self._cardkit_sequences: Dict[str, int] = {}
         self._cardkit_locks: Dict[str, asyncio.Lock] = {}
+        self._cardkit_state_order: "OrderedDict[str, None]" = OrderedDict()
         self._client: Optional[Any] = None
         # Adapter-owned thread pool for blocking Feishu SDK calls. Routing SDK
         # work through this pool (instead of asyncio's shared default executor)
@@ -2113,20 +2115,65 @@ class FeishuAdapter(BasePlatformAdapter):
         )
 
     def _next_cardkit_sequence(self, card_id: str) -> int:
-        sequence = int(self._cardkit_sequences.get(card_id, 0) or 0) + 1
-        self._cardkit_sequences[card_id] = sequence
-        return sequence
+        """Return the next sequence without committing it locally.
+
+        Feishu does not consume a sequence when it rejects an operation (for
+        example when the 10-minute streaming window has closed).  Advancing
+        the local counter before the response is confirmed makes the recovery
+        request skip a number and immediately fail with 300317.
+        """
+        return int(self._cardkit_sequences.get(card_id, 0) or 0) + 1
+
+    def _commit_cardkit_sequence(self, card_id: str, sequence: int) -> None:
+        self._cardkit_sequences[card_id] = int(sequence)
+        self._touch_cardkit_state(card_id)
+
+    def _touch_cardkit_state(self, card_id: str) -> None:
+        """Keep recently-finalized cards available for one last reconcile.
+
+        The gateway may perform a stale-final correction after the stream
+        consumer finalized the card.  Dropping the sequence at finalize made
+        that correction restart from a low value and caused 300317 plus a
+        duplicate normal final send.  Retain a bounded LRU instead.
+        """
+        self._cardkit_state_order.pop(card_id, None)
+        self._cardkit_state_order[card_id] = None
+        attempts = len(self._cardkit_state_order)
+        while (
+            len(self._cardkit_state_order) > self._CARDKIT_STATE_CACHE_SIZE
+            and attempts > 0
+        ):
+            attempts -= 1
+            stale_id, _ = self._cardkit_state_order.popitem(last=False)
+            stale_lock = self._cardkit_locks.get(stale_id)
+            if stale_lock is not None and stale_lock.locked():
+                self._cardkit_state_order[stale_id] = None
+                continue
+            self._cardkit_sequences.pop(stale_id, None)
+            self._cardkit_locks.pop(stale_id, None)
 
     def _cardkit_lock(self, card_id: str) -> asyncio.Lock:
         lock = self._cardkit_locks.get(card_id)
         if lock is None:
             lock = asyncio.Lock()
             self._cardkit_locks[card_id] = lock
+        self._touch_cardkit_state(card_id)
         return lock
 
     def _cleanup_cardkit_state(self, card_id: str) -> None:
         self._cardkit_sequences.pop(card_id, None)
         self._cardkit_locks.pop(card_id, None)
+        self._cardkit_state_order.pop(card_id, None)
+
+    @staticmethod
+    def _is_cardkit_streaming_closed_error(exc: BaseException) -> bool:
+        text = str(exc or "").lower()
+        return bool(
+            re.search(r"\b(?:200510|300309)\b", text)
+            or "streaming mode is closed" in text
+            or "card streaming timeout" in text
+            or ("streaming" in text and "timeout" in text)
+        )
 
     async def _create_cardkit_card(self, card: Dict[str, Any]) -> str:
         if not self._cardkit_available():
@@ -2156,16 +2203,19 @@ class FeishuAdapter(BasePlatformAdapter):
         # begin at 2, matching Feishu's live API and the Xiaosheng CardKit
         # implementation.  Starting mutations at 1 can survive creation but
         # later fails during final settings/update with 300317.
-        self._cardkit_sequences[str(card_id)] = 1
-        return str(card_id)
+        card_id = str(card_id)
+        self._cardkit_sequences[card_id] = 1
+        self._touch_cardkit_state(card_id)
+        return card_id
 
     async def _stream_cardkit_content(self, card_id: str, content: str) -> None:
         if not self._cardkit_available():
             raise RuntimeError("CardKit SDK is unavailable")
+        sequence = self._next_cardkit_sequence(card_id)
         body = (
             ContentCardElementRequestBody.builder()
             .content(content or " ")
-            .sequence(self._next_cardkit_sequence(card_id))
+            .sequence(sequence)
             .uuid(str(uuid.uuid4()))
             .build()
         )
@@ -2190,18 +2240,42 @@ class FeishuAdapter(BasePlatformAdapter):
                     default_message="cardkit content update failed",
                 ).error
             )
+        self._commit_cardkit_sequence(card_id, sequence)
+
+    async def _stream_cardkit_content_with_recovery(
+        self,
+        card_id: str,
+        content: str,
+    ) -> None:
+        """Re-open Feishu's expired 10-minute stream and retry once."""
+        try:
+            await self._stream_cardkit_content(card_id, content)
+        except Exception as exc:
+            if not self._is_cardkit_streaming_closed_error(exc):
+                raise
+            logger.info(
+                "[Feishu] CardKit streaming window closed; reopening card %s and retrying update",
+                card_id,
+            )
+            await self._set_cardkit_streaming_mode(card_id, True)
+            await self._stream_cardkit_content(card_id, content)
 
     async def _set_cardkit_streaming_mode(
         self,
         card_id: str,
-        streaming_mode: int,
+        streaming_mode: bool,
     ) -> None:
         if not self._cardkit_available():
             raise RuntimeError("CardKit SDK is unavailable")
+        sequence = self._next_cardkit_sequence(card_id)
         body = (
             SettingsCardRequestBody.builder()
-            .settings(json.dumps({"streaming_mode": streaming_mode}))
-            .sequence(self._next_cardkit_sequence(card_id))
+            .settings(
+                json.dumps(
+                    {"config": {"streaming_mode": bool(streaming_mode)}}
+                )
+            )
+            .sequence(sequence)
             .uuid(str(uuid.uuid4()))
             .build()
         )
@@ -2222,6 +2296,7 @@ class FeishuAdapter(BasePlatformAdapter):
                     default_message="cardkit settings failed",
                 ).error
             )
+        self._commit_cardkit_sequence(card_id, sequence)
 
     async def _update_cardkit_card(
         self,
@@ -2230,6 +2305,7 @@ class FeishuAdapter(BasePlatformAdapter):
     ) -> None:
         if not self._cardkit_available():
             raise RuntimeError("CardKit SDK is unavailable")
+        sequence = self._next_cardkit_sequence(card_id)
         card_body = (
             Card.builder()
             .type("card_json")
@@ -2239,7 +2315,7 @@ class FeishuAdapter(BasePlatformAdapter):
         body = (
             UpdateCardRequestBody.builder()
             .card(card_body)
-            .sequence(self._next_cardkit_sequence(card_id))
+            .sequence(sequence)
             .uuid(str(uuid.uuid4()))
             .build()
         )
@@ -2260,6 +2336,7 @@ class FeishuAdapter(BasePlatformAdapter):
                     default_message="cardkit update failed",
                 ).error
             )
+        self._commit_cardkit_sequence(card_id, sequence)
 
     async def _close_cardkit_card_before_fallback(
         self,
@@ -2284,7 +2361,7 @@ class FeishuAdapter(BasePlatformAdapter):
             except Exception as exc:
                 logger.warning("[Feishu] Failed to update orphan CardKit notice: %s", exc)
                 try:
-                    await self._set_cardkit_streaming_mode(card_id, 0)
+                    await self._set_cardkit_streaming_mode(card_id, False)
                 except Exception as close_exc:
                     logger.warning(
                         "[Feishu] Failed to stop orphan CardKit streaming: %s",
@@ -2638,6 +2715,7 @@ class FeishuAdapter(BasePlatformAdapter):
         self._shutdown_sdk_executor()
         self._cardkit_sequences.clear()
         self._cardkit_locks.clear()
+        self._cardkit_state_order.clear()
         self._persist_seen_message_ids()
         await self._release_app_lock()
 
@@ -2736,7 +2814,7 @@ class FeishuAdapter(BasePlatformAdapter):
                         )
                         if initial_content.strip():
                             try:
-                                await self._stream_cardkit_content(
+                                await self._stream_cardkit_content_with_recovery(
                                     card_id,
                                     initial_content,
                                 )
@@ -2906,7 +2984,7 @@ class FeishuAdapter(BasePlatformAdapter):
                                 ),
                             )
                         else:
-                            await self._stream_cardkit_content(
+                            await self._stream_cardkit_content_with_recovery(
                                 card_id,
                                 self._compose_unified_stream_content(
                                     content,
@@ -2925,12 +3003,23 @@ class FeishuAdapter(BasePlatformAdapter):
                         )
                         await self._close_cardkit_card_before_fallback(
                             card_id,
-                            "CardKit 更新失败，已切换到兼容卡片。",
+                            (
+                                "流式展示已中断，正在发送最终结果。"
+                                if finalize
+                                else "流式展示已中断，任务仍在运行；完成后将发送最终结果。"
+                            ),
                             cleanup=False,
                         )
                         message_id = im_message_id
                     finally:
-                        if finalize or message_id == im_message_id:
+                        # A successful finalize may still be followed by the
+                        # gateway's stale-final reconciliation edit.  Keep the
+                        # bounded CardKit sequence state so that edit continues
+                        # from the server-confirmed value instead of restarting
+                        # at 1 and triggering 300317.  Once we truly switch to
+                        # the compatibility message id, the CardKit state is no
+                        # longer used and can be released immediately.
+                        if message_id == im_message_id:
                             self._cleanup_cardkit_state(card_id)
 
             if (

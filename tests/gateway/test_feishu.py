@@ -255,7 +255,7 @@ class TestFeishuAdapterMessaging(unittest.TestCase):
             data=SimpleNamespace(message_id="om_123"),
         )
         adapter._create_cardkit_card = AsyncMock(return_value="card_123")
-        adapter._stream_cardkit_content = AsyncMock()
+        adapter._stream_cardkit_content_with_recovery = AsyncMock()
         adapter._feishu_send_with_retry = AsyncMock(return_value=response)
 
         result = asyncio.run(
@@ -268,7 +268,7 @@ class TestFeishuAdapterMessaging(unittest.TestCase):
 
         self.assertTrue(result.success)
         self.assertEqual(result.message_id, "cardkit:card_123:om_123")
-        adapter._stream_cardkit_content.assert_awaited_once_with(
+        adapter._stream_cardkit_content_with_recovery.assert_awaited_once_with(
             "card_123",
             "正在分析",
         )
@@ -486,7 +486,7 @@ class TestFeishuAdapterMessaging(unittest.TestCase):
             data=SimpleNamespace(message_id="om_123"),
         )
         adapter._create_cardkit_card = AsyncMock(return_value="card_123")
-        adapter._stream_cardkit_content = AsyncMock(
+        adapter._stream_cardkit_content_with_recovery = AsyncMock(
             side_effect=RuntimeError("content rejected")
         )
         adapter._close_cardkit_card_before_fallback = AsyncMock()
@@ -575,11 +575,143 @@ class TestFeishuAdapterMessaging(unittest.TestCase):
         self.assertEqual(captured["content"].request_body.sequence, 2)
         self.assertEqual(captured["settings"].card_id, "card_123")
         self.assertEqual(captured["settings"].request_body.sequence, 3)
+        self.assertEqual(
+            json.loads(captured["settings"].request_body.settings),
+            {"config": {"streaming_mode": False}},
+        )
         self.assertEqual(captured["update"].card_id, "card_123")
         self.assertEqual(captured["update"].request_body.sequence, 4)
         self.assertEqual(adapter._cardkit_sequences["card_123"], 4)
 
-    def test_cardkit_finalize_updates_card_and_releases_per_card_state(self):
+    @unittest.skipUnless(_HAS_LARK_OAPI, "lark-oapi is required for CardKit tests")
+    def test_cardkit_rejected_request_does_not_advance_sequence(self):
+        from gateway.config import PlatformConfig
+        from plugins.platforms.feishu.adapter import FeishuAdapter
+
+        captured = {}
+
+        class _CardElementAPI:
+            def content(self, request):
+                captured["sequence"] = request.request_body.sequence
+                return SimpleNamespace(
+                    success=lambda: False,
+                    code=300309,
+                    msg="streaming mode is closed",
+                )
+
+        adapter = FeishuAdapter(
+            PlatformConfig(extra={"streaming_mode": "cardkit"})
+        )
+        adapter._client = SimpleNamespace(
+            cardkit=SimpleNamespace(
+                v1=SimpleNamespace(
+                    card=SimpleNamespace(),
+                    card_element=_CardElementAPI(),
+                )
+            )
+        )
+        adapter._cardkit_sequences["card_123"] = 7
+
+        with self.assertRaisesRegex(RuntimeError, "300309"):
+            asyncio.run(
+                adapter._stream_cardkit_content(
+                    "card_123",
+                    "仍在运行",
+                )
+            )
+
+        self.assertEqual(captured["sequence"], 8)
+        self.assertEqual(adapter._cardkit_sequences["card_123"], 7)
+
+    @unittest.skipUnless(_HAS_LARK_OAPI, "lark-oapi is required for CardKit tests")
+    def test_cardkit_timeout_recovery_reuses_rejected_sequence_then_continues(self):
+        from gateway.config import PlatformConfig
+        from plugins.platforms.feishu.adapter import FeishuAdapter
+
+        content_sequences = []
+        settings_sequences = []
+
+        class _CardAPI:
+            def settings(self, request):
+                settings_sequences.append(request.request_body.sequence)
+                return SimpleNamespace(success=lambda: True)
+
+        class _CardElementAPI:
+            def content(self, request):
+                content_sequences.append(request.request_body.sequence)
+                if len(content_sequences) == 1:
+                    return SimpleNamespace(
+                        success=lambda: False,
+                        code=300309,
+                        msg="streaming mode is closed",
+                    )
+                return SimpleNamespace(success=lambda: True)
+
+        adapter = FeishuAdapter(
+            PlatformConfig(extra={"streaming_mode": "cardkit"})
+        )
+        adapter._client = SimpleNamespace(
+            cardkit=SimpleNamespace(
+                v1=SimpleNamespace(
+                    card=_CardAPI(),
+                    card_element=_CardElementAPI(),
+                )
+            )
+        )
+        adapter._cardkit_sequences["card_123"] = 7
+
+        asyncio.run(
+            adapter._stream_cardkit_content_with_recovery(
+                "card_123",
+                "任务仍在运行",
+            )
+        )
+
+        self.assertEqual(content_sequences, [8, 9])
+        self.assertEqual(settings_sequences, [8])
+        self.assertEqual(adapter._cardkit_sequences["card_123"], 9)
+
+    @unittest.skipUnless(_HAS_LARK_OAPI, "lark-oapi is required for CardKit tests")
+    def test_cardkit_finalize_reconcile_continues_confirmed_sequence(self):
+        from gateway.config import PlatformConfig
+        from plugins.platforms.feishu.adapter import FeishuAdapter
+
+        sequences = []
+
+        class _CardAPI:
+            def update(self, request):
+                sequences.append(request.request_body.sequence)
+                return SimpleNamespace(success=lambda: True)
+
+        adapter = FeishuAdapter(
+            PlatformConfig(extra={"streaming_mode": "cardkit"})
+        )
+        adapter._client = SimpleNamespace(
+            cardkit=SimpleNamespace(
+                v1=SimpleNamespace(
+                    card=_CardAPI(),
+                    card_element=SimpleNamespace(),
+                )
+            )
+        )
+        adapter._cardkit_sequences["card_123"] = 7
+
+        async def _finalize_twice():
+            for content in ("预览最终答案", "完整最终答案"):
+                result = await adapter.edit_message(
+                    chat_id="oc_chat",
+                    message_id="cardkit:card_123:om_123",
+                    content=content,
+                    finalize=True,
+                )
+                self.assertTrue(result.success)
+
+        asyncio.run(_finalize_twice())
+
+        self.assertEqual(sequences, [8, 9])
+        self.assertEqual(adapter._cardkit_sequences["card_123"], 9)
+
+    def test_cardkit_finalize_updates_card_and_retains_state_for_reconcile(self):
         from gateway.config import PlatformConfig
         from plugins.platforms.feishu.adapter import FeishuAdapter
 
@@ -617,8 +749,36 @@ class TestFeishuAdapterMessaging(unittest.TestCase):
         self.assertIn("✅ read_file (0.2s)", final_payload)
         self.assertIn("工具调用记录（1）", final_payload)
         self.assertIn("🔧 1 tools", final_payload)
-        self.assertNotIn("card_123", adapter._cardkit_sequences)
-        self.assertNotIn("card_123", adapter._cardkit_locks)
+        self.assertEqual(adapter._cardkit_sequences["card_123"], 4)
+        self.assertIn("card_123", adapter._cardkit_locks)
+
+    def test_cardkit_stream_timeout_reopens_and_retries_without_false_failure(self):
+        from gateway.config import PlatformConfig
+        from plugins.platforms.feishu.adapter import FeishuAdapter
+
+        adapter = FeishuAdapter(
+            PlatformConfig(extra={"streaming_mode": "cardkit"})
+        )
+        adapter._stream_cardkit_content = AsyncMock(
+            side_effect=[
+                RuntimeError("[300309] streaming mode is closed"),
+                None,
+            ]
+        )
+        adapter._set_cardkit_streaming_mode = AsyncMock()
+
+        asyncio.run(
+            adapter._stream_cardkit_content_with_recovery(
+                "card_123",
+                "任务仍在运行",
+            )
+        )
+
+        self.assertEqual(adapter._stream_cardkit_content.await_count, 2)
+        adapter._set_cardkit_streaming_mode.assert_awaited_once_with(
+            "card_123",
+            True,
+        )
 
     def test_cardkit_failure_closes_orphan_and_falls_back_to_interactive_card(self):
         from gateway.config import PlatformConfig
@@ -704,7 +864,7 @@ class TestFeishuAdapterMessaging(unittest.TestCase):
         adapter._update_cardkit_card.assert_awaited_once()
         adapter._set_cardkit_streaming_mode.assert_awaited_once_with(
             "card_123",
-            0,
+            False,
         )
         self.assertNotIn("card_123", adapter._cardkit_sequences)
 
@@ -726,7 +886,7 @@ class TestFeishuAdapterMessaging(unittest.TestCase):
         )
         adapter._cardkit_sequences["card_123"] = 3
         adapter._cardkit_locks["card_123"] = asyncio.Lock()
-        adapter._stream_cardkit_content = AsyncMock(
+        adapter._stream_cardkit_content_with_recovery = AsyncMock(
             side_effect=RuntimeError("content rejected")
         )
         adapter._close_cardkit_card_before_fallback = AsyncMock()
