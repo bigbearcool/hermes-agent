@@ -4764,6 +4764,58 @@ def _configure_immediate_prompt_run(
     monkeypatch.setattr(server, "_get_db", lambda: None)
 
 
+def test_run_prompt_submit_binds_exact_steer_authority_and_resets_contextvars(
+    monkeypatch, tmp_path
+):
+    """The turn thread commissions children with this session generation only."""
+    from tools.delegate_tool import _capture_gateway_steer_authority
+    from tui_gateway.transport import (
+        bind_transport,
+        current_transport,
+        reset_transport,
+    )
+
+    class _Transport:
+        def write(self, _obj):
+            return True
+
+        def close(self):
+            return None
+
+    observed = {}
+    owner_transport = _Transport()
+    previous_transport = _Transport()
+    previous_record = {"session_key": "previous-generation"}
+
+    class _CapturingAgent(_RecordingAgent):
+        def run_conversation(self, prompt, **kwargs):
+            authority = _capture_gateway_steer_authority("sid-owner")
+            observed["transport"] = authority[0]
+            observed["record"] = authority[1]
+            return super().run_conversation(prompt, **kwargs)
+
+    _configure_immediate_prompt_run(monkeypatch, tmp_path)
+    session = _session(
+        session_key="session-owner",
+        agent=_CapturingAgent([]),
+        running=True,
+        transport=owner_transport,
+    )
+    server._sessions["sid-owner"] = session
+    transport_token = bind_transport(previous_transport)
+    record_token = server._current_runtime_session_record.set(previous_record)
+    try:
+        server._run_prompt_submit("rid-owner", "sid-owner", session, "commission")
+
+        assert observed == {"transport": owner_transport, "record": session}
+        assert current_transport() is previous_transport
+        assert server._current_runtime_session_record.get() is previous_record
+    finally:
+        server._current_runtime_session_record.reset(record_token)
+        reset_transport(transport_token)
+        server._sessions.pop("sid-owner", None)
+
+
 class _RecordingAgent:
     model = "test-model"
     provider = "test-provider"
@@ -4892,8 +4944,9 @@ def test_run_prompt_submit_requeues_all_unstarted_notifications_with_real_thread
             return {"final_response": "", "messages": []}
 
     monkeypatch.setattr(server.threading, "Thread", _recording_thread)
+    session_key = "session-requeue-unstarted"
     session = _session(
-        session_key="session-a",
+        session_key=session_key,
         agent=_BlockingNotificationAgent(turns),
         running=True,
     )
@@ -4901,7 +4954,7 @@ def test_run_prompt_submit_requeues_all_unstarted_notifications_with_real_thread
         {
             "type": "completion",
             "session_id": f"proc_batch_{index}",
-            "session_key": "session-a",
+            "session_key": session_key,
             "command": "safe-test-command",
             "exit_code": 0,
             "output": f"owned-{index}",
