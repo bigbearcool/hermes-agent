@@ -32,7 +32,9 @@ Usage:
 
 Environment:
     HERMES_TEST_WORKERS  Override worker count (default: os.cpu_count())
-    HERMES_TEST_PATHS    Override discovery roots (colon-sep, default: 'tests')
+    HERMES_TEST_PATHS    Override discovery roots (colon-sep; on Windows
+                         ';' also works and drive letters are handled;
+                         default: 'tests')
 
 Exit code: 0 if every file's pytest exited 0; 1 otherwise.
 """
@@ -42,8 +44,10 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import shutil
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor, Future
@@ -98,6 +102,41 @@ _DEFAULT_FILE_RETRIES = 1
 # wall-clock seconds. Used by ``--slice`` to distribute files across
 # CI jobs by estimated total time, so no one job gets all the slow files.
 _DURATIONS_FILE = "test_durations.json"
+
+
+def _split_pathspec(value: str) -> List[str]:
+    """Split a separator-joined path list (``--paths``/``--files``/
+    ``HERMES_TEST_PATHS``) into individual paths.
+
+    POSIX: ``:``-separated, as documented.
+
+    Windows: ``;`` (``os.pathsep``) and ``:`` are both accepted as
+    separators, but a ``:`` that forms a drive letter (``C:\\...`` or
+    ``C:/...``) stays glued to its path — a naive ``split(":")`` turns
+    ``C:\\repo\\tests`` into ``['C', '\\repo\\tests']``, where the bogus
+    ``C`` becomes a phantom discovery root and the rooted remainder only
+    resolves by accident of ``Path.__truediv__`` re-anchoring it onto
+    ``repo_root``'s drive.
+    """
+    if sys.platform != "win32":
+        return [p for p in value.split(":") if p.strip()]
+    parts: List[str] = []
+    for chunk in value.split(";"):
+        raw = chunk.split(":")
+        i = 0
+        while i < len(raw):
+            part = raw[i]
+            if (
+                len(part) == 1
+                and part.isalpha()
+                and i + 1 < len(raw)
+                and raw[i + 1][:1] in ("\\", "/")
+            ):
+                part = f"{part}:{raw[i + 1]}"
+                i += 1
+            parts.append(part)
+            i += 1
+    return [p for p in parts if p.strip()]
 
 
 def _approximately_count_tests(
@@ -305,7 +344,24 @@ def _run_one_file_once(
     file_timeout: float,
 ) -> Tuple[Path, int, str, dict[str, int], float]:
     """Single attempt of a per-file pytest subprocess (see _run_one_file)."""
-    cmd = [sys.executable, "-m", "pytest", str(file), *pytest_args]
+    owns_basetemp = not any(
+        arg == "--basetemp" or arg.startswith("--basetemp=")
+        for arg in pytest_args
+    )
+    base_temp = (
+        Path(tempfile.mkdtemp(prefix="hermes-pytest-"))
+        if owns_basetemp
+        else None
+    )
+    base_temp_args = [f"--basetemp={base_temp}"] if base_temp is not None else []
+    cmd = [
+        sys.executable,
+        "-m",
+        "pytest",
+        str(file),
+        *base_temp_args,
+        *pytest_args,
+    ]
     
     subproc_start = time.monotonic()
     # launch the pytest process
@@ -352,6 +408,8 @@ def _run_one_file_once(
         # KeyboardInterrupt / runner crash — make sure no zombie
         # grandchildren outlive us.
         _kill_tree(proc, pgid=pgid)
+        if base_temp is not None:
+            shutil.rmtree(base_temp, ignore_errors=True)
         raise
     else:
         # Happy path: pytest exited on its own. Kill the group anyway in
@@ -370,6 +428,8 @@ def _run_one_file_once(
         rc = 0
     summary = _parse_pytest_summary(output)
     subproc_wall = time.monotonic() - subproc_start
+    if base_temp is not None:
+        shutil.rmtree(base_temp, ignore_errors=True)
     return file, rc, output, summary, subproc_wall
 
 
@@ -689,7 +749,11 @@ def main() -> int:
     parser.add_argument(
         "--paths",
         default=os.environ.get("HERMES_TEST_PATHS", ":".join(_DEFAULT_ROOTS)),
-        help="Colon-separated discovery roots (default: 'tests')",
+        help=(
+            "Colon-separated discovery roots (default: 'tests'). On "
+            "Windows, ';' also separates and drive letters (C:\\...) are "
+            "kept intact."
+        ),
     )
     parser.add_argument(
         "--include-integration",
@@ -748,9 +812,10 @@ def main() -> int:
         "--files",
         metavar="LIST",
         help=(
-            "Explicit colon-separated list of test files to run. Bypasses "
-            "discovery entirely — used by CI matrix jobs that receive their "
-            "file list from the generate job."
+            "Explicit colon-separated list of test files to run (on "
+            "Windows, ';' also separates and drive letters are kept "
+            "intact). Bypasses discovery entirely — used by CI matrix "
+            "jobs that receive their file list from the generate job."
         ),
     )
     parser.add_argument(
@@ -885,7 +950,7 @@ def main() -> int:
 
     # --files: explicit file list from the CI generate job — skip discovery.
     if args.files:
-        files = [repo_root / f for f in args.files.split(":") if f.strip()]
+        files = [repo_root / f for f in _split_pathspec(args.files)]
         roots = []
     else:
         # Resolve discovery roots: positional path args override --paths if any
@@ -893,7 +958,7 @@ def main() -> int:
         if args.paths_positional:
             roots = [repo_root / p for p in args.paths_positional]
         else:
-            roots = [repo_root / p for p in args.paths.split(":") if p]
+            roots = [repo_root / p for p in _split_pathspec(args.paths)]
 
         if args.include_integration:
             # Caller takes responsibility — typically used via explicit -k filter.

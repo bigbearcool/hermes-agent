@@ -56,7 +56,9 @@ _EXEMPT_DIRS = (
 
 def _is_exempt_top_level(name: str) -> bool:
     """Return whether *name* is outside the repository source surface."""
-    return name in _EXEMPT_DIRS or name.startswith(("venv.", ".venv."))
+    return name in _EXEMPT_DIRS or name.startswith(
+        ("venv.", ".venv.", "hermes_agent-")
+    )
 
 # Call sites where a bare PATH lookup is the correct answer. Each entry is
 # (path, command) -> why. Keep this list short and justified — the default
@@ -121,11 +123,20 @@ def _iter_which_calls(tree: ast.AST):
 
 def _source_files() -> list[Path]:
     files: list[Path] = []
-    for path in REPO_ROOT.rglob("*.py"):
-        rel = path.relative_to(REPO_ROOT)
-        if rel.parts and _is_exempt_top_level(rel.parts[0]):
+    for root in REPO_ROOT.iterdir():
+        if _is_exempt_top_level(root.name):
             continue
-        files.append(path)
+        try:
+            if root.is_file():
+                if root.suffix == ".py":
+                    files.append(root)
+                continue
+            if root.is_dir():
+                files.extend(root.rglob("*.py"))
+        except OSError:
+            # Parallel packaging tests can remove scratch trees between
+            # iterdir() and traversal. They are not repository source.
+            continue
     return files
 
 
@@ -177,6 +188,7 @@ def test_no_unreviewed_bare_managed_runtime_lookups():
     [
         ("venv.stale.runtime-123", True),
         (".venv.stale.runtime-123", True),
+        ("hermes_agent-0.20.0", True),
         ("agent", False),
     ],
 )

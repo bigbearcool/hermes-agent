@@ -1258,7 +1258,12 @@ def _restore_stashed_changes(
         if input_fn is not None:
             response = input_fn("Restore local changes now? [Y/n]", "y")
         else:
-            response = input().strip().lower()
+            try:
+                response = input().strip().lower()
+            except (EOFError, UnicodeDecodeError):
+                # A closed stdin or terminal encoding issue must not crash an
+                # update while local changes are safely held in the stash.
+                response = "n"
         if response not in {"", "y", "yes"}:
             print("Skipped restoring local changes.")
             print("Your changes are still preserved in git stash.")
@@ -2458,13 +2463,9 @@ def _run_pre_update_backup(args) -> Optional[str]:
     except OSError:
         size_bytes = 0
 
-    # Human-readable size
-    size_str = f"{size_bytes} B"
-    for unit in ("KB", "MB", "GB"):
-        if size_bytes < 1024:
-            break
-        size_bytes /= 1024
-        size_str = f"{size_bytes:.1f} {unit}"
+    from hermes_cli.sizefmt import format_bytes
+
+    size_str = format_bytes(size_bytes)
 
     # Render path using display_hermes_home so the user sees ~/.hermes/...
     try:
@@ -4306,6 +4307,12 @@ def _cmd_update_impl(args, gateway_mode: bool):
                         .lower()
                     )
                 except EOFError:
+                    response = "n"
+                except UnicodeDecodeError:
+                    print(
+                        "  ⚠ Could not read input (encoding issue). Skipping. "
+                        "Run 'hermes config migrate' manually to configure."
+                    )
                     response = "n"
 
             if response in {"", "y", "yes", "auto"}:
