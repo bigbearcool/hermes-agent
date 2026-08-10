@@ -3146,6 +3146,19 @@ _PROVIDER_MODELS_STALE_SERVE_MAX = 7 * 24 * 3600  # 7d
 _swr_refresh_inflight: set = set()
 _swr_refresh_lock = threading.Lock()
 
+# Per-endpoint locks collapse concurrent cold-cache probes.  Startup prewarm
+# and the first foreground picker open can overlap when another provider makes
+# prewarm slow; without single-flight behavior both callers miss the disk cache
+# and issue the same /models request before either one persists its result.
+_custom_model_fetch_locks: dict[str, threading.Lock] = {}
+_custom_model_fetch_locks_guard = threading.Lock()
+_provider_models_cache_io_lock = threading.RLock()
+
+
+def _custom_model_fetch_lock(cache_key: str) -> threading.Lock:
+    with _custom_model_fetch_locks_guard:
+        return _custom_model_fetch_locks.setdefault(cache_key, threading.Lock())
+
 
 def _spawn_swr_refresh(cache_key: str, refresh_fn=None) -> None:
     """Kick a background refresh of *cache_key*'s model-id cache entry.
@@ -3180,9 +3193,7 @@ def _spawn_swr_refresh(cache_key: str, refresh_fn=None) -> None:
         try:
             entry = (refresh_fn or _default_refresh)()
             if entry:
-                cache = _load_provider_models_cache()
-                cache[cache_key] = entry
-                _save_provider_models_cache(cache)
+                _set_provider_models_cache_entry(cache_key, entry)
         except Exception:
             logger.debug("SWR refresh failed for %s", cache_key, exc_info=True)
         finally:
@@ -3284,12 +3295,13 @@ def _credential_fingerprint(provider: str) -> str:
 def _load_provider_models_cache() -> dict:
     """Return the full cache dict, or {} on any error."""
     try:
-        path = _provider_models_cache_path()
-        if not path.exists():
-            return {}
-        with open(path, encoding="utf-8") as f:
-            data = json.load(f)
-        return data if isinstance(data, dict) else {}
+        with _provider_models_cache_io_lock:
+            path = _provider_models_cache_path()
+            if not path.exists():
+                return {}
+            with open(path, encoding="utf-8") as f:
+                data = json.load(f)
+            return data if isinstance(data, dict) else {}
     except Exception:
         return {}
 
@@ -3298,11 +3310,20 @@ def _save_provider_models_cache(data: dict) -> None:
     """Persist the cache dict. Best-effort — silent on any error."""
     try:
         from utils import atomic_json_write
-        path = _provider_models_cache_path()
-        path.parent.mkdir(parents=True, exist_ok=True)
-        atomic_json_write(path, data, indent=None)
+        with _provider_models_cache_io_lock:
+            path = _provider_models_cache_path()
+            path.parent.mkdir(parents=True, exist_ok=True)
+            atomic_json_write(path, data, indent=None)
     except Exception:
         pass
+
+
+def _set_provider_models_cache_entry(cache_key: str, entry: dict) -> None:
+    """Atomically merge one entry into the shared provider-model cache."""
+    with _provider_models_cache_io_lock:
+        cache = _load_provider_models_cache()
+        cache[cache_key] = entry
+        _save_provider_models_cache(cache)
 
 
 def cached_provider_model_ids(
@@ -3339,12 +3360,11 @@ def cached_provider_model_ids(
     # Cache miss / stale / forced refresh — call the live path.
     live = provider_model_ids(normalized, force_refresh=force_refresh)
     if live:
-        cache[normalized] = {
+        _set_provider_models_cache_entry(normalized, {
             "fp": fp,
             "at": now,
             "models": list(live),
-        }
-        _save_provider_models_cache(cache)
+        })
         return list(live)
 
     # Live fetch returned nothing. If we have a stale entry with the
@@ -3364,15 +3384,17 @@ def clear_provider_models_cache(provider: Optional[str] = None) -> None:
     """
     try:
         if provider is None:
-            path = _provider_models_cache_path()
-            if path.exists():
-                path.unlink()
+            with _provider_models_cache_io_lock:
+                path = _provider_models_cache_path()
+                if path.exists():
+                    path.unlink()
             return
-        cache = _load_provider_models_cache()
-        normalized = normalize_provider(provider) or provider or ""
-        if normalized in cache:
-            del cache[normalized]
-            _save_provider_models_cache(cache)
+        with _provider_models_cache_io_lock:
+            cache = _load_provider_models_cache()
+            normalized = normalize_provider(provider) or provider or ""
+            if normalized in cache:
+                del cache[normalized]
+                _save_provider_models_cache(cache)
     except Exception:
         pass
 
@@ -4812,19 +4834,34 @@ def cached_fetch_api_models(
             _spawn_swr_refresh(cache_key, _refresh_custom)
             return list(entry["models"])
 
-    live = fetch_api_models(
-        api_key, base_url, timeout=timeout, api_mode=api_mode, headers=headers
-    )
-    if live:
-        cache[cache_key] = {"fp": fp, "at": now, "models": list(live)}
-        _save_provider_models_cache(cache)
-        return list(live)
+    # Collapse concurrent cold-cache probes for the same endpoint. Startup
+    # prewarm can overlap the first picker open; the waiter must re-read the
+    # disk cache after the leader completes instead of issuing a duplicate
+    # network request from its stale pre-lock snapshot.
+    with _custom_model_fetch_lock(cache_key):
+        cache = _load_provider_models_cache()
+        entry = cache.get(cache_key)
+        now = time.time()
+        if not force_refresh and _cache_entry_valid(entry, fp):
+            age = now - entry["at"]
+            if age < ttl_seconds:
+                return list(entry["models"])
 
-    # Live fetch returned nothing (offline endpoint, timeout, auth hiccup).
-    # A stale same-fingerprint entry beats an empty result.
-    if _cache_entry_valid(entry, fp):
-        return list(entry["models"])
-    return live
+        live = fetch_api_models(
+            api_key, base_url, timeout=timeout, api_mode=api_mode, headers=headers
+        )
+        if live:
+            _set_provider_models_cache_entry(
+                cache_key,
+                {"fp": fp, "at": now, "models": list(live)},
+            )
+            return list(live)
+
+        # Live fetch returned nothing (offline endpoint, timeout, auth hiccup).
+        # A stale same-fingerprint entry beats an empty result.
+        if _cache_entry_valid(entry, fp):
+            return list(entry["models"])
+        return live
 
 
 # ---------------------------------------------------------------------------
