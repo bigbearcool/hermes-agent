@@ -20,7 +20,7 @@ from tui_gateway import server
 
 @pytest.fixture(autouse=True)
 def _neuter_agent_prewarm_timer(request, monkeypatch):
-    """Stub the deferred agent pre-warm timer for every test in this module.
+    """Contain background workers started by every test in this module.
 
     ``session.create`` and non-eager ``session.resume`` fire a 50 ms
     background ``threading.Timer`` (``_schedule_agent_build``) that calls
@@ -30,12 +30,49 @@ def _neuter_agent_prewarm_timer(request, monkeypatch):
     ``'tip' == 'cont_tip'`` flakes in the session_resume tests). Tests that
     exercise the deferred build itself opt back in with
     ``@pytest.mark.real_agent_prewarm``.
+
+    Notification pollers have the same cross-test hazard: their queue reads
+    can outlive the test that started them and consume the next test's mocked
+    completion. Track real pollers here, signal them at teardown, and wait for
+    their loop to exit before pytest restores the monkeypatched globals.
     """
-    if request.node.get_closest_marker("real_agent_prewarm"):
-        yield
-        return
-    monkeypatch.setattr(server, "_schedule_agent_build", lambda *a, **k: None)
+    original_poller_loop = server._notification_poller_loop
+    original_start_poller = server._start_notification_poller
+    poller_stops = []
+    active_pollers = set()
+    poller_state = threading.Condition()
+
+    def _tracked_poller_loop(*args, **kwargs):
+        worker = threading.current_thread()
+        with poller_state:
+            active_pollers.add(worker)
+        try:
+            return original_poller_loop(*args, **kwargs)
+        finally:
+            with poller_state:
+                active_pollers.discard(worker)
+                poller_state.notify_all()
+
+    def _tracked_start_poller(*args, **kwargs):
+        stop = original_start_poller(*args, **kwargs)
+        poller_stops.append(stop)
+        return stop
+
+    monkeypatch.setattr(server, "_notification_poller_loop", _tracked_poller_loop)
+    monkeypatch.setattr(server, "_start_notification_poller", _tracked_start_poller)
+    if not request.node.get_closest_marker("real_agent_prewarm"):
+        monkeypatch.setattr(server, "_schedule_agent_build", lambda *a, **k: None)
+
     yield
+
+    for stop in poller_stops:
+        stop.set()
+
+    deadline = time.monotonic() + 6.0
+    with poller_state:
+        while active_pollers and time.monotonic() < deadline:
+            poller_state.wait(timeout=deadline - time.monotonic())
+        assert not active_pollers, "notification poller leaked past test teardown"
 
 
 def test_session_slot_is_claimed_on_first_turn_not_on_create(monkeypatch, tmp_path):
@@ -349,6 +386,11 @@ def test_prompt_submit_fails_open_inline_when_compute_host_dispatch_breaks(monke
 
 
 def test_compute_host_turn_end_updates_metadata_mirror(monkeypatch):
+    # The module-level update prefetch can finish between the emitted snapshot
+    # and the explicit comparison snapshot under a busy full-suite run.
+    # Freeze that unrelated async input so this test isolates the metadata
+    # mirror contract it is meant to exercise.
+    monkeypatch.setattr("hermes_cli.banner.get_update_result", lambda timeout=0.5: 0)
     session = _session(
         agent=None,
         agent_ready=threading.Event(),
