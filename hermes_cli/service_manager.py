@@ -497,7 +497,7 @@ def _seed_supervise_skeleton(svc_dir: Path) -> None:
             # setgid bit. Move only the group to the caller's effective group;
             # in production that is the hermes group.
             try:
-                os.chown(path, -1, os.getegid())
+                os.chown(path, -1, os.getegid())  # windows-footgun: ok — s6 is POSIX-only
             except PermissionError:
                 pass
         # chown may clear set-ID bits on POSIX (including macOS), so apply the
