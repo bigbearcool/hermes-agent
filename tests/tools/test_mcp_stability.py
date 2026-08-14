@@ -383,7 +383,9 @@ class TestStdioPgroupReaping:
             [sys.executable, str(parent_script)],
             start_new_session=True,
         )
-        parent_pgid = os.getpgid(parent.pid)
+        # start_new_session=True makes the parent the new process-group leader,
+        # so its pgid is its pid even if the short-lived wrapper already exited.
+        parent_pgid = parent.pid
         # Wait for parent to exit and grandchild to spin up.
         parent.wait(timeout=15)
         deadline = _time.time() + 15  # fresh CPython spinup dilates under CI load
