@@ -220,6 +220,12 @@ def test_mixed_batch_preserves_tool_call_result_pairing(agent_env):
     # and each must have exactly one matching tool result.
     assert set(tc_ids) == {"call_0", "call_1"}
     assert sorted(result_ids) == sorted(tc_ids)
+    assert all(
+        isinstance(message.get("timestamp"), float)
+        for message in msgs
+        if isinstance(message, dict)
+        and message.get("role") in {"user", "assistant", "tool"}
+    )
 
 
 
