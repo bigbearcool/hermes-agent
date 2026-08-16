@@ -27,6 +27,24 @@ class TestPostSetupGate:
             "computer_use", {}
         ) is True
 
+    def test_incompatible_cua_driver_forces_setup(self, monkeypatch):
+        from hermes_cli import tools_config
+
+        monkeypatch.setattr(tools_config, "_cua_driver_install_ready", lambda: False)
+
+        assert tools_config._toolset_needs_configuration_prompt(
+            "computer_use", {}
+        ) is True
+
+    def test_compatible_cua_driver_skips_setup(self, monkeypatch):
+        from hermes_cli import tools_config
+
+        monkeypatch.setattr(tools_config, "_cua_driver_install_ready", lambda: True)
+
+        assert tools_config._toolset_needs_configuration_prompt(
+            "computer_use", {}
+        ) is False
+
 
     def test_post_setup_predicate_exception_does_not_block(self, monkeypatch):
         """A predicate that raises must be treated as 'satisfied' so a
