@@ -10,7 +10,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
-from gateway.config import PlatformConfig
+from gateway.config import Platform, PlatformConfig
 from gateway.platforms.base import SendResult
 
 
@@ -137,6 +137,34 @@ class TestWeComReplyMode:
         args = adapter._send_reply_request.await_args.args
         assert args[0] == "req-1"
         assert args[1] == {"msgtype": "image", "image": {"media_id": "media-1"}}
+
+
+class TestNativeStreamGatewayGate:
+    def test_native_draft_platform_is_not_skipped_for_lack_of_edit_support(self):
+        from types import SimpleNamespace
+        from gateway.run import GatewayRunner
+
+        class NativeStreamAdapter:
+            SUPPORTS_MESSAGE_EDITING = False
+
+            def supports_draft_streaming(self, chat_type=None, metadata=None):
+                return True
+
+        source = SimpleNamespace(platform=Platform.WECOM, chat_type="dm")
+        scfg = SimpleNamespace(
+            cursor="▍",
+            edit_interval=0.5,
+            buffer_threshold=20,
+            fresh_final_after_seconds=0.0,
+            transport="auto",
+        )
+
+        config, _ = GatewayRunner._build_stream_consumer_config(
+            object(), source, scfg, NativeStreamAdapter(), on_missing_cursor="raise"
+        )
+
+        assert config.transport == "auto"
+        assert config.cursor == ""
 
 
 class TestNativeStreamReply:

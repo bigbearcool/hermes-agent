@@ -27404,9 +27404,21 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         # first message that can never be updated, resulting in
         # duplicate messages (partial + final).
         # (The proxy path instead opts into a cursorless fallback
-        # via on_missing_cursor="fallback".)
+        # via on_missing_cursor="fallback".)  Native draft-stream transports
+        # (for example WeCom's official ``stream.id`` update protocol) do not
+        # edit a sent message, but are still safe to stream: their adapter owns
+        # the one-message lifecycle.  Do not reject those adapters merely
+        # because ``SUPPORTS_MESSAGE_EDITING`` is false.
         _adapter_supports_edit = getattr(adapter, "SUPPORTS_MESSAGE_EDITING", True)
-        if not _adapter_supports_edit and on_missing_cursor == "raise":
+        _adapter_supports_draft = False
+        if not _adapter_supports_edit and hasattr(adapter, "supports_draft_streaming"):
+            try:
+                _adapter_supports_draft = bool(adapter.supports_draft_streaming(
+                    chat_type=getattr(source, "chat_type", "") or None,
+                ))
+            except Exception:
+                logger.debug("native draft streaming capability probe failed", exc_info=True)
+        if not _adapter_supports_edit and not _adapter_supports_draft and on_missing_cursor == "raise":
             raise RuntimeError("skip streaming for non-editable platform")
         _effective_cursor = scfg.cursor if _adapter_supports_edit else ""
         # Some Matrix clients render the streaming cursor
