@@ -139,6 +139,28 @@ class TestWeComReplyMode:
         assert args[1] == {"msgtype": "image", "image": {"media_id": "media-1"}}
 
 
+class TestTypingAcknowledgement:
+    @pytest.mark.asyncio
+    async def test_send_typing_sends_one_proactive_working_ack_per_inbound_request(self):
+        from plugins.platforms.wecom.adapter import APP_CMD_SEND, WeComAdapter
+
+        adapter = WeComAdapter(PlatformConfig(enabled=True))
+        adapter._last_chat_req_ids["chat-123"] = "req-inbound-1"
+        adapter._send_request = AsyncMock(return_value={"headers": {"req_id": "req-status"}, "errcode": 0})
+
+        await adapter.send_typing("chat-123")
+        await adapter.send_typing("chat-123")
+
+        adapter._send_request.assert_awaited_once_with(
+            APP_CMD_SEND,
+            {
+                "chatid": "chat-123",
+                "msgtype": "markdown",
+                "markdown": {"content": "⏳ 正在处理，请稍候…"},
+            },
+        )
+
+
 class TestExtractText:
 
     def test_extracts_mixed_text(self):

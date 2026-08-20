@@ -217,6 +217,11 @@ class WeComAdapter(BasePlatformAdapter):
         self._pending_text_batch_tasks: Dict[str, asyncio.Task] = {}
         self._device_id = uuid.uuid4().hex
         self._last_chat_req_ids: Dict[str, str] = {}
+        # Each inbound request gets at most one proactive working acknowledgement.
+        # WeCom has no native typing state and cannot edit messages, so tracking
+        # the latest req_id per chat prevents the gateway's typing refresh loop
+        # from turning one turn into a stream of permanent status messages.
+        self._typing_ack_req_ids: Dict[str, str] = {}
 
     # ------------------------------------------------------------------
     # Connection lifecycle
@@ -1555,8 +1560,35 @@ class WeComAdapter(BasePlatformAdapter):
         )
 
     async def send_typing(self, chat_id: str, metadata=None) -> None:
-        """WeCom does not expose typing indicators in this adapter."""
-        del chat_id, metadata
+        """Send one visible working acknowledgement for each inbound WeCom turn.
+
+        The WeCom AI Bot protocol has neither typing indicators nor message
+        editing.  Use a proactive Markdown status rather than consuming the
+        inbound request's one-shot reply channel, so the final answer can still
+        be delivered as the normal reply.  The gateway refreshes typing during
+        a long run, thus the current inbound ``req_id`` is used as a per-turn
+        deduplication key.
+        """
+        del metadata
+        req_id = self._last_chat_req_ids.get(chat_id)
+        if not req_id or self._typing_ack_req_ids.get(chat_id) == req_id:
+            return
+
+        self._typing_ack_req_ids[chat_id] = req_id
+        try:
+            response = await self._send_request(
+                APP_CMD_SEND,
+                {
+                    "chatid": chat_id,
+                    "msgtype": "markdown",
+                    "markdown": {"content": "⏳ 正在处理，请稍候…"},
+                },
+            )
+            self._raise_for_wecom_error(response, "send working acknowledgement")
+        except Exception:
+            # A transient send failure should not suppress the next refresh.
+            self._typing_ack_req_ids.pop(chat_id, None)
+            logger.debug("[%s] Working acknowledgement send failed", self.name, exc_info=True)
 
     async def get_chat_info(self, chat_id: str) -> Dict[str, Any]:
         """Return minimal chat info."""
