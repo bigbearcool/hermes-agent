@@ -217,11 +217,9 @@ class WeComAdapter(BasePlatformAdapter):
         self._pending_text_batch_tasks: Dict[str, asyncio.Task] = {}
         self._device_id = uuid.uuid4().hex
         self._last_chat_req_ids: Dict[str, str] = {}
-        # Each inbound request gets at most one proactive working acknowledgement.
-        # WeCom has no native typing state and cannot edit messages, so tracking
-        # the latest req_id per chat prevents the gateway's typing refresh loop
-        # from turning one turn into a stream of permanent status messages.
-        self._typing_ack_req_ids: Dict[str, str] = {}
+        # chat_id -> (inbound callback req_id, official stream.id).  A WeCom
+        # stream is finalized by the normal gateway final send, then removed.
+        self._active_streams: Dict[str, tuple[str, str]] = {}
 
     # ------------------------------------------------------------------
     # Connection lifecycle
@@ -1438,22 +1436,41 @@ class WeComAdapter(BasePlatformAdapter):
             return SendResult(success=False, error="chat_id is required")
 
         try:
-            reply_req_id = self._reply_req_id_for_message(reply_to)
-
-            if not reply_req_id and chat_id in self._last_chat_req_ids:
-                reply_req_id = self._last_chat_req_ids[chat_id]
-
-            if reply_req_id:
-                response = await self._send_reply_markdown(reply_req_id, content)
-            else:
-                response = await self._send_request(
-                    APP_CMD_SEND,
+            # A native stream preview is already visible for this turn.  Finish
+            # that same official stream instead of emitting a second Markdown
+            # bubble; the WeCom client updates the original reply in place.
+            active_stream = self._active_streams.get(chat_id)
+            if active_stream:
+                stream_req_id, stream_id = active_stream
+                response = await self._send_reply_request(
+                    stream_req_id,
                     {
-                        "chatid": chat_id,
-                        "msgtype": "markdown",
-                        "markdown": {"content": content[:self.MAX_MESSAGE_LENGTH]},
+                        "msgtype": "stream",
+                        "stream": {
+                            "id": stream_id,
+                            "finish": True,
+                            "content": content[:self.MAX_MESSAGE_LENGTH],
+                        },
                     },
                 )
+                self._active_streams.pop(chat_id, None)
+            else:
+                reply_req_id = self._reply_req_id_for_message(reply_to)
+
+                if not reply_req_id and chat_id in self._last_chat_req_ids:
+                    reply_req_id = self._last_chat_req_ids[chat_id]
+
+                if reply_req_id:
+                    response = await self._send_reply_markdown(reply_req_id, content)
+                else:
+                    response = await self._send_request(
+                        APP_CMD_SEND,
+                        {
+                            "chatid": chat_id,
+                            "msgtype": "markdown",
+                            "markdown": {"content": content[:self.MAX_MESSAGE_LENGTH]},
+                        },
+                    )
         except asyncio.TimeoutError:
             return SendResult(success=False, error="Timeout sending message to WeCom")
         except Exception as exc:
@@ -1559,36 +1576,49 @@ class WeComAdapter(BasePlatformAdapter):
             reply_to=reply_to,
         )
 
-    async def send_typing(self, chat_id: str, metadata=None) -> None:
-        """Send one visible working acknowledgement for each inbound WeCom turn.
+    def supports_draft_streaming(
+        self,
+        chat_type: Optional[str] = None,
+        metadata: Optional[Dict[str, Any]] = None,
+    ) -> bool:
+        """WeCom long connections natively update ``stream.id`` replies."""
+        del chat_type, metadata
+        return True
 
-        The WeCom AI Bot protocol has neither typing indicators nor message
-        editing.  Use a proactive Markdown status rather than consuming the
-        inbound request's one-shot reply channel, so the final answer can still
-        be delivered as the normal reply.  The gateway refreshes typing during
-        a long run, thus the current inbound ``req_id`` is used as a per-turn
-        deduplication key.
-        """
+    async def send_draft(
+        self,
+        chat_id: str,
+        draft_id: int,
+        content: str,
+        metadata: Optional[Dict[str, Any]] = None,
+    ) -> SendResult:
+        """Create or update the official WeCom long-connection stream reply."""
         del metadata
         req_id = self._last_chat_req_ids.get(chat_id)
-        if not req_id or self._typing_ack_req_ids.get(chat_id) == req_id:
-            return
-
-        self._typing_ack_req_ids[chat_id] = req_id
+        if not req_id:
+            return SendResult(success=False, error="No inbound WeCom request context for stream")
+        stream_id = f"hermes-{draft_id}"
         try:
-            response = await self._send_request(
-                APP_CMD_SEND,
+            response = await self._send_reply_request(
+                req_id,
                 {
-                    "chatid": chat_id,
-                    "msgtype": "markdown",
-                    "markdown": {"content": "⏳ 正在处理，请稍候…"},
+                    "msgtype": "stream",
+                    "stream": {
+                        "id": stream_id,
+                        "finish": False,
+                        "content": content[:self.MAX_MESSAGE_LENGTH],
+                    },
                 },
             )
-            self._raise_for_wecom_error(response, "send working acknowledgement")
-        except Exception:
-            # A transient send failure should not suppress the next refresh.
-            self._typing_ack_req_ids.pop(chat_id, None)
-            logger.debug("[%s] Working acknowledgement send failed", self.name, exc_info=True)
+            self._raise_for_wecom_error(response, "send stream reply")
+        except Exception as exc:
+            return SendResult(success=False, error=str(exc))
+        self._active_streams[chat_id] = (req_id, stream_id)
+        return SendResult(success=True, message_id=stream_id, raw_response=response)
+
+    async def send_typing(self, chat_id: str, metadata=None) -> None:
+        """Native stream frames replace permanent typing/status messages."""
+        del chat_id, metadata
 
     async def get_chat_info(self, chat_id: str) -> Dict[str, Any]:
         """Return minimal chat info."""

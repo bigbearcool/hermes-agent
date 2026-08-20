@@ -139,26 +139,48 @@ class TestWeComReplyMode:
         assert args[1] == {"msgtype": "image", "image": {"media_id": "media-1"}}
 
 
-class TestTypingAcknowledgement:
+class TestNativeStreamReply:
     @pytest.mark.asyncio
-    async def test_send_typing_sends_one_proactive_working_ack_per_inbound_request(self):
-        from plugins.platforms.wecom.adapter import APP_CMD_SEND, WeComAdapter
+    async def test_send_draft_updates_one_official_stream_and_final_send_closes_it(self):
+        from plugins.platforms.wecom.adapter import WeComAdapter
 
         adapter = WeComAdapter(PlatformConfig(enabled=True))
         adapter._last_chat_req_ids["chat-123"] = "req-inbound-1"
-        adapter._send_request = AsyncMock(return_value={"headers": {"req_id": "req-status"}, "errcode": 0})
+        adapter._send_reply_request = AsyncMock(return_value={"headers": {"req_id": "req-inbound-1"}, "errcode": 0})
+
+        first = await adapter.send_draft("chat-123", draft_id=7, content="正在查询")
+        update = await adapter.send_draft("chat-123", draft_id=7, content="正在查询 ToDesk 状态")
+        final = await adapter.send("chat-123", "ToDesk 服务正常")
+
+        assert first.success and update.success and final.success
+        assert adapter._send_reply_request.await_count == 3
+        first_call, update_call, final_call = adapter._send_reply_request.await_args_list
+        assert first_call.args[0] == "req-inbound-1"
+        assert first_call.args[1] == {
+            "msgtype": "stream",
+            "stream": {"id": "hermes-7", "finish": False, "content": "正在查询"},
+        }
+        assert update_call.args[1]["stream"] == {
+            "id": "hermes-7", "finish": False, "content": "正在查询 ToDesk 状态"
+        }
+        assert final_call.args[0] == "req-inbound-1"
+        assert final_call.args[1] == {
+            "msgtype": "stream",
+            "stream": {"id": "hermes-7", "finish": True, "content": "ToDesk 服务正常"},
+        }
+
+
+class TestTypingAcknowledgement:
+    @pytest.mark.asyncio
+    async def test_send_typing_is_silent_when_native_streaming_owns_the_reply(self):
+        from plugins.platforms.wecom.adapter import WeComAdapter
+
+        adapter = WeComAdapter(PlatformConfig(enabled=True))
+        adapter._send_request = AsyncMock()
 
         await adapter.send_typing("chat-123")
-        await adapter.send_typing("chat-123")
 
-        adapter._send_request.assert_awaited_once_with(
-            APP_CMD_SEND,
-            {
-                "chatid": "chat-123",
-                "msgtype": "markdown",
-                "markdown": {"content": "⏳ 正在处理，请稍候…"},
-            },
-        )
+        adapter._send_request.assert_not_awaited()
 
 
 class TestExtractText:
