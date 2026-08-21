@@ -1365,6 +1365,14 @@ class GatewayStreamConsumer:
                     )
 
                 current_update_visible = False
+                # Whether the got_done update below was delivered as a FRESH
+                # persistent send through the native-draft transport (drafts
+                # have no message id, so the finalize tick is a brand-new
+                # send that already carried finalize=True).  Distinguishes
+                # that case from an EDIT issued while draft streaming is
+                # active, which must keep the legacy explicit-finalize pass
+                # for REQUIRES_EDIT_FINALIZE adapters.
+                draft_final_fresh_send = False
                 # Hold back mid-stream edits while the buffer so far could
                 # still resolve to an intentional-silence marker.  Without
                 # this, a partial marker (e.g. "NO_REPLY" streamed as
@@ -1547,6 +1555,11 @@ class GatewayStreamConsumer:
                     # new message below it.  got_done has its own finalize
                     # path below so we don't finalize here for it.
                     had_edit_target = self._message_id is not None
+                    draft_final_fresh_send = (
+                        got_done
+                        and self._use_draft_streaming
+                        and self._message_id is None
+                    )
                     current_update_visible = await self._send_or_edit(
                         display_text,
                         finalize=(got_done or got_segment_break),
@@ -1589,19 +1602,26 @@ class GatewayStreamConsumer:
                                     self._single_streaming_message
                                     and had_edit_target
                                 )
+                                or draft_final_fresh_send
                             )
                         ):
-                            # Mid-stream edit above already delivered the
-                            # final accumulated content with ``finalize=True``.
-                            # Skip the redundant final edit for adapters that
-                            # don't need an explicit finalize signal, for
-                            # single-message streaming adapters (their first
-                            # finalize is terminal), and for any adapter when
-                            # that edit split-and-delivered across
-                            # continuations. Re-finalizing a CardKit message
-                            # after it has closed streaming mode produces
-                            # Feishu 300309/300317 errors; overflow streams can
-                            # also duplicate adopted continuation chunks.
+                            # The update above already delivered the final
+                            # accumulated content with ``finalize=True``.
+                            # Single-message adapters must not be finalized a
+                            # second time after editing an existing target:
+                            # doing so re-closes CardKit and produces Feishu
+                            # 300309/300317 errors. Native drafts have no
+                            # message id, so their got_done update is instead a
+                            # fresh persistent send; finalizing that again can
+                            # replace a Telegram rich final with legacy text.
+                            #
+                            # Also skip the redundant final edit for adapters
+                            # that don't need an explicit finalize signal, and
+                            # for any adapter when the update split-and-
+                            # delivered across continuations: that update
+                            # carried finalize=True itself, and re-finalizing
+                            # with the full text would overflow-split again into
+                            # the adopted continuation, duplicating chunks.
                             #
                             # Record the last ACKED edit rather than the
                             # accumulated text so a frozen preview cannot be
