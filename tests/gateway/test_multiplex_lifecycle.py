@@ -2,6 +2,7 @@
 import pytest
 
 from gateway.config import GatewayConfig
+from gateway.restart import GATEWAY_FATAL_CONFIG_EXIT_CODE
 
 
 class TestServedProfilesStatus:
@@ -81,8 +82,9 @@ class TestNamedProfileMultiplexerGuard:
 
         from hermes_cli import gateway as gw
 
-        with pytest.raises(SystemExit, match="1"):
+        with pytest.raises(SystemExit) as excinfo:
             gw._guard_named_profile_under_multiplexer(force=False)
+        assert excinfo.value.code == GATEWAY_FATAL_CONFIG_EXIT_CODE
 
     def test_served_profile_is_still_guarded(self, monkeypatch, tmp_path):
         self._fake_running_default_gateway(monkeypatch, tmp_path)
@@ -96,8 +98,9 @@ class TestNamedProfileMultiplexerGuard:
 
         from hermes_cli import gateway as gw
 
-        with pytest.raises(SystemExit, match="1"):
+        with pytest.raises(SystemExit) as excinfo:
             gw._guard_named_profile_under_multiplexer(force=False)
+        assert excinfo.value.code == GATEWAY_FATAL_CONFIG_EXIT_CODE
 
     @pytest.mark.parametrize(
         "allowlist_yaml",

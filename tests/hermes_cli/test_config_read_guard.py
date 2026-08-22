@@ -50,6 +50,9 @@ ALLOWLIST = {
 EXCLUDED_DIR_PARTS = {
     "tests", ".venv", ".git", ".worktrees", "node_modules", "website",
     "docs", "scripts", "examples", "apps",
+    # Compiled bytecode is not source. Sibling test processes also create
+    # and delete these directories while this scan walks the tree.
+    "__pycache__",
 }
 
 # A safe_load within this many lines of a config.yaml reference is treated
@@ -61,19 +64,27 @@ CONFIG_YAML_RE = re.compile(r"""["']config\.yaml["']""")
 
 
 def _iter_source_files():
-    for root, dirs, files in os.walk(REPO_ROOT):
-        # Prune volatile bytecode caches and excluded trees before descending.
-        # pathlib.rglob() can race with test cleanup deleting __pycache__.
-        dirs[:] = [
-            name
-            for name in dirs
-            if name not in EXCLUDED_DIR_PARTS and name != "__pycache__"
-        ]
-        root_path = Path(root)
-        for name in files:
-            if name.endswith(".py"):
-                path = root_path / name
-                yield path.relative_to(REPO_ROOT), path
+    # This uses os.walk with a pruned dirnames, and not rglob. rglob descends
+    # into every directory and filters after that, so it calls scandir() on
+    # __pycache__ trees that this guard never inspects. Sibling test processes
+    # create and delete those entries during the run.
+    #
+    # A directory that disappears in the middle of a walk raises
+    # FileNotFoundError out of rglob. The test then fails for a reason that it
+    # does not assert.
+    #
+    # The prune skips those trees. The onerror callback ignores a directory
+    # that disappears anyway.
+    for dirpath, dirnames, filenames in os.walk(REPO_ROOT, onerror=lambda _e: None):
+        dirnames[:] = [d for d in dirnames if d not in EXCLUDED_DIR_PARTS]
+        for name in filenames:
+            if not name.endswith(".py"):
+                continue
+            path = Path(dirpath) / name
+            rel = path.relative_to(REPO_ROOT)
+            if any(part in EXCLUDED_DIR_PARTS for part in rel.parts):
+                continue
+            yield rel, path
 
 
 def test_no_raw_config_yaml_reads_outside_owner_modules():

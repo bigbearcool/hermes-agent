@@ -363,7 +363,11 @@ def test_different_controller_identity_hard_replaces_parked_session_controller()
 
 
 def test_failed_deferred_cancel_flush_keeps_controller_offline():
-    broker = BrowserControlBroker(command_timeout=0.01)
+    # Leave enough time for the test thread to mark the transport offline
+    # before the command deadline. Under a loaded per-file test runner, a
+    # 10 ms deadline can expire immediately after ``ready`` is signalled and
+    # exercise the connected cancel path instead of the deferred one.
+    broker = BrowserControlBroker(command_timeout=0.2)
     scope = _scope()
     thread, outcome, _frames = _start_pending(broker, scope)
     assert broker.disconnect_owner("owner-fixture") == 1
