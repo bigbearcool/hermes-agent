@@ -40,6 +40,15 @@ def _patch_managed_uv(request):
         yield
 
 
+@pytest.fixture(autouse=True)
+def _isolate_macos_gateway_restart(monkeypatch):
+    """Unit tests must not restart or validate the host's live launchd fleet."""
+    monkeypatch.setattr(
+        "hermes_cli.update_cmd._restart_macos_launchd_gateways",
+        lambda *a, **k: None,
+    )
+
+
 
 
 

@@ -12,7 +12,18 @@ import subprocess
 from types import SimpleNamespace
 from unittest.mock import patch
 
+import pytest
+
 from hermes_cli.main import cmd_update
+
+
+@pytest.fixture(autouse=True)
+def _isolate_macos_gateway_restart(monkeypatch):
+    """Prompt tests must not restart or validate the host's live launchd fleet."""
+    monkeypatch.setattr(
+        "hermes_cli.update_cmd._restart_macos_launchd_gateways",
+        lambda *a, **k: None,
+    )
 
 
 def _make_run_side_effect(
