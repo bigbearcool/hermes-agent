@@ -148,31 +148,42 @@ async def authorize_device(
             client, server_url
         )
 
-        registration_payload = {
-            "client_name": client_name,
-            "token_endpoint_auth_method": "none",
-            "grant_types": [DEVICE_GRANT_TYPE, "refresh_token"],
-            "application_type": "native",
-        }
-        if scope:
-            registration_payload["scope"] = scope
-        registration_response = await client.post(
-            registration_endpoint, json=registration_payload
-        )
-        if registration_response.status_code not in {200, 201}:
-            payload = await _read_json(registration_response, step="client registration")
-            raise DeviceOAuthError(
-                "client registration",
-                _safe_error(payload, fallback=f"HTTP {registration_response.status_code}"),
+        client_info = await storage.get_client_info()
+        stored_grants = set(client_info.grant_types or []) if client_info is not None else set()
+        stored_issuer = str(getattr(client_info, "issuer", "") or "").rstrip("/")
+        discovered_issuer = str(metadata.issuer).rstrip("/")
+        if (
+            client_info is None
+            or DEVICE_GRANT_TYPE not in stored_grants
+            or stored_issuer != discovered_issuer
+        ):
+            registration_payload = {
+                "client_name": client_name,
+                "token_endpoint_auth_method": "none",
+                "grant_types": [DEVICE_GRANT_TYPE, "refresh_token"],
+                "application_type": "native",
+            }
+            if scope:
+                registration_payload["scope"] = scope
+            registration_response = await client.post(
+                registration_endpoint, json=registration_payload
             )
-        try:
-            client_info = await handle_registration_response(registration_response)
-        except Exception as exc:
-            raise DeviceOAuthError("client registration", "invalid registration response") from exc
-        client_data = client_info.model_dump(mode="json", exclude_none=True)
-        client_data["issuer"] = str(metadata.issuer)
-        client_info = OAuthClientInformationFull.model_validate(client_data)
-        await storage.set_client_info(client_info)
+            if registration_response.status_code not in {200, 201}:
+                payload = await _read_json(registration_response, step="client registration")
+                raise DeviceOAuthError(
+                    "client registration",
+                    _safe_error(payload, fallback=f"HTTP {registration_response.status_code}"),
+                )
+            try:
+                client_info = await handle_registration_response(registration_response)
+            except Exception as exc:
+                raise DeviceOAuthError(
+                    "client registration", "invalid registration response"
+                ) from exc
+            client_data = client_info.model_dump(mode="json", exclude_none=True)
+            client_data["issuer"] = str(metadata.issuer)
+            client_info = OAuthClientInformationFull.model_validate(client_data)
+            await storage.set_client_info(client_info)
         storage.save_oauth_metadata(metadata)
 
         device_payload = {"client_id": client_info.client_id}

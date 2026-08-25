@@ -146,6 +146,102 @@ async def test_device_flow_discovers_registers_polls_and_persists(tmp_path, monk
     assert token_file.stat().st_mode & 0o077 == 0
 
 
+@pytest.mark.asyncio
+async def test_device_flow_reuses_matching_registered_client(tmp_path, monkeypatch):
+    from mcp.shared.auth import OAuthClientInformationFull
+    from tools import mcp_device_oauth
+    from tools.mcp_oauth import HermesTokenStorage
+
+    storage = HermesTokenStorage("xiaosheng", hermes_home=tmp_path)
+    await storage.set_client_info(
+        OAuthClientInformationFull(
+            client_id="existing-device-client",
+            client_name="Hermes Agent",
+            grant_types=[mcp_device_oauth.DEVICE_GRANT_TYPE, "refresh_token"],
+            token_endpoint_auth_method="none",
+            issuer="https://tenant.example.com",
+        )
+    )
+
+    registration_calls = []
+
+    class ReuseClient:
+        def __init__(self, **_kwargs):
+            self.poll_count = 0
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *_args):
+            return False
+
+        async def send(self, request):
+            import httpx
+
+            url = str(request.url)
+            if "oauth-protected-resource" in url:
+                payload = {
+                    "resource": "https://tenant.example.com/mcp",
+                    "authorization_servers": ["https://tenant.example.com"],
+                }
+            else:
+                payload = {
+                    "issuer": "https://tenant.example.com",
+                    "authorization_endpoint": "https://tenant.example.com/oauth/authorize",
+                    "device_authorization_endpoint": "https://tenant.example.com/oauth/device/authorization",
+                    "token_endpoint": "https://tenant.example.com/oauth/token",
+                    "registration_endpoint": "https://tenant.example.com/oauth/register",
+                    "grant_types_supported": [mcp_device_oauth.DEVICE_GRANT_TYPE, "refresh_token"],
+                    "response_types_supported": ["code"],
+                }
+            return httpx.Response(200, json=payload, request=httpx.Request("GET", url))
+
+        async def post(self, url, *, json=None, data=None):
+            import httpx
+
+            if url.endswith("/oauth/register"):
+                registration_calls.append(json)
+                raise AssertionError("matching client registration must be reused")
+            if url.endswith("/oauth/device/authorization"):
+                assert data["client_id"] == "existing-device-client"
+                payload = {
+                    "device_code": "device-code",
+                    "user_code": "XS-REUSE-1234",
+                    "verification_uri": "https://tenant.example.com/verify",
+                    "expires_in": 60,
+                    "interval": 1,
+                }
+                return httpx.Response(201, json=payload, request=httpx.Request("POST", url))
+            payload = {
+                "access_token": "access-secret",
+                "refresh_token": "refresh-secret",
+                "token_type": "Bearer",
+                "expires_in": 3600,
+            }
+            return httpx.Response(200, json=payload, request=httpx.Request("POST", url))
+
+    class FakeHttpx:
+        import httpx as _httpx
+
+        Timeout = _httpx.Timeout
+        AsyncClient = ReuseClient
+
+    async def no_sleep(_seconds):
+        return None
+
+    monkeypatch.setattr("tools.mcp_tool.sdk_httpx", lambda: FakeHttpx)
+    monkeypatch.setattr(mcp_device_oauth.asyncio, "sleep", no_sleep)
+
+    tokens = await mcp_device_oauth.authorize_device(
+        "xiaosheng",
+        "https://tenant.example.com/mcp",
+        hermes_home=tmp_path,
+    )
+
+    assert tokens.access_token == "access-secret"
+    assert registration_calls == []
+
+
 def test_device_cli_parser_accepts_scope_and_device_auth():
     import argparse
 
