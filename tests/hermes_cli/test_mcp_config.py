@@ -175,6 +175,43 @@ class TestMcpRemove:
 
 class TestMcpAdd:
 
+    def test_add_device_oauth_server_persists_flow_and_scope(self, tmp_path, capsys, monkeypatch):
+        captured = {}
+
+        def fake_authorize(name, url, **kwargs):
+            captured.update(name=name, url=url, **kwargs)
+
+        monkeypatch.setattr(
+            "tools.mcp_device_oauth.run_device_authorization", fake_authorize
+        )
+        monkeypatch.setattr(
+            "hermes_cli.mcp_config._probe_single_server",
+            lambda _name, _config, **_kwargs: [("whoami", "Show identity")],
+        )
+        monkeypatch.setattr("builtins.input", lambda _: "")
+
+        from hermes_cli.mcp_config import cmd_mcp_add
+
+        cmd_mcp_add(
+            _make_args(
+                name="xiaosheng",
+                url="https://tenant.example.com/mcp",
+                auth="device",
+                scope="agent:list work:read",
+            )
+        )
+
+        from hermes_cli.config import load_config
+
+        server = load_config()["mcp_servers"]["xiaosheng"]
+        assert server["auth"] == "oauth"
+        assert server["oauth"] == {
+            "flow": "device",
+            "scope": "agent:list work:read",
+        }
+        assert captured["scope"] == "agent:list work:read"
+        assert "Device Authorization completed" in capsys.readouterr().out
+
     def test_add_http_server_all_tools(self, tmp_path, capsys, monkeypatch):
         """Add an HTTP server, accept all tools."""
         fake_tools = [

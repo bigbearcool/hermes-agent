@@ -447,6 +447,7 @@ def cmd_mcp_add(args):
     if cmd_args and cmd_args[0] == "--":
         cmd_args = cmd_args[1:]
     auth_type = getattr(args, "auth", None)
+    oauth_scope = getattr(args, "scope", None)
     preset_name = getattr(args, "preset", None)
     raw_env = getattr(args, "env", None)
     raw_connect_timeout = getattr(args, "connect_timeout", None)
@@ -507,17 +508,49 @@ def cmd_mcp_add(args):
 
     # ── Authentication ────────────────────────────────────────────────
 
-    if url and auth_type == "oauth":
+    if url and auth_type == "device":
+        print()
+        _info(f"Starting Device Authorization flow for '{name}'...")
+
+        def _display_device_authorization(info):
+            print()
+            _info("Approve this MCP connection:")
+            print(f"    {info.verification_uri_complete or info.verification_uri}")
+            if not info.verification_uri_complete:
+                print(f"    Device code: {info.user_code}")
+            _info(f"Waiting for approval (expires in {info.expires_in // 60 or 1} minute(s))...")
+
+        try:
+            from tools.mcp_device_oauth import run_device_authorization
+
+            run_device_authorization(
+                name,
+                url,
+                scope=oauth_scope,
+                display=_display_device_authorization,
+            )
+        except Exception as exc:
+            _error(f"Device Authorization failed: {exc}")
+            return
+        server_config["auth"] = "oauth"
+        server_config["oauth"] = {"flow": "device"}
+        if oauth_scope:
+            server_config["oauth"]["scope"] = oauth_scope
+        _success("Device Authorization completed")
+
+    elif url and auth_type == "oauth":
         print()
         _info(f"Starting OAuth flow for '{name}'...")
         oauth_ok = False
         try:
             from tools.mcp_oauth_manager import get_manager
             oauth_auth = get_manager().get_or_build_provider(
-                name, url, server_config.get("oauth")
+                name, url, {"scope": oauth_scope} if oauth_scope else server_config.get("oauth")
             )
             if oauth_auth:
                 server_config["auth"] = "oauth"
+                if oauth_scope:
+                    server_config["oauth"] = {"scope": oauth_scope}
                 _success("OAuth configured (tokens will be acquired on first connection)")
                 oauth_ok=True
             else:
@@ -770,7 +803,8 @@ def cmd_mcp_test(args):
     auth_type = cfg.get("auth", "")
     headers = cfg.get("headers", {})
     if auth_type == "oauth":
-        _info("Auth: OAuth 2.1 PKCE")
+        oauth_flow = (cfg.get("oauth") or {}).get("flow")
+        _info("Auth: OAuth 2.0 Device Authorization" if oauth_flow == "device" else "Auth: OAuth 2.1 PKCE")
     elif headers:
         for k, v in headers.items():
             if isinstance(v, str) and ("key" in k.lower() or "auth" in k.lower()):
@@ -834,6 +868,35 @@ def _reauth_oauth_server(name: str, server_config: dict) -> bool:
 
     print()
     _info(f"Starting OAuth flow for '{name}'...")
+
+    oauth_config = server_config.get("oauth") or {}
+    if oauth_config.get("flow") == "device":
+        def _display_device_authorization(info):
+            print()
+            _info("Approve this MCP connection:")
+            print(f"    {info.verification_uri_complete or info.verification_uri}")
+            if not info.verification_uri_complete:
+                print(f"    Device code: {info.user_code}")
+            _info("Waiting for approval...")
+
+        try:
+            from tools.mcp_device_oauth import run_device_authorization
+
+            run_device_authorization(
+                name,
+                url,
+                scope=oauth_config.get("scope"),
+                display=_display_device_authorization,
+            )
+            tools = _probe_single_server(name, server_config)
+            if not _oauth_tokens_present(name):
+                _error("Authentication failed: no OAuth token was persisted")
+                return False
+            _success(f"Authenticated — {len(tools)} tool(s) available")
+            return True
+        except Exception as exc:
+            _error(f"Authentication failed: {exc}")
+            return False
 
     # Probe triggers the OAuth flow (browser redirect + callback capture).
     # Honor the server's configured connect_timeout so a human has enough

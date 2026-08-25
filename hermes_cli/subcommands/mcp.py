@@ -58,7 +58,15 @@ def build_mcp_parser(subparsers, *, cmd_mcp: Callable) -> None:
         default=[],
         help="Arguments for stdio command; must be the last option",
     )
-    mcp_add_p.add_argument("--auth", choices=["oauth", "header"], help="Auth method")
+    mcp_add_p.add_argument(
+        "--auth",
+        choices=["oauth", "device", "header"],
+        help="Auth method (oauth uses browser PKCE; device works in pure CLI)",
+    )
+    mcp_add_p.add_argument(
+        "--scope",
+        help="Space-separated OAuth scopes requested from the MCP server",
+    )
     mcp_add_p.add_argument("--preset", help="Known MCP preset name")
     mcp_add_p.add_argument(
         "--connect-timeout",
