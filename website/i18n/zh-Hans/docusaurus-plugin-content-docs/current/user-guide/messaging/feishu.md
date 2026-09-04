@@ -239,7 +239,22 @@ FEISHU_ALLOW_BOTS=mentions   # 默认：none
 
 对端机器人无需加入 `FEISHU_ALLOWED_USERS`——该白名单仅适用于人类发送者。
 
-授予 `application:bot.basic_info:read` 权限范围可显示对端机器人名称；未授权时，对端机器人仍可正常路由，但显示为其 `open_id`。
+要接收其他机器人的 @提及，必须授予
+`im:message.group_at_msg.include_bot:readonly`，发布新应用版本并获得租户管理员批准。
+授予 `application:bot.basic_info:read` 可显示对端机器人名称；未授权时，
+对端机器人仍可正常路由，但显示为其 `open_id`。
+
+向另一个机器人交接任务时，Hermes 使用显式的原生 mention 格式：
+
+```text
+<at user_id="ou_peer_bot_open_id">对端机器人</at> 请继续分析。
+```
+
+适配器会将该标记转换为飞书 `post` 消息中的原生 `at` 元素。普通
+`@机器人名称` 只是显示文本，不会触发对端机器人。请在对应群的
+channel prompt 或 Agent Memory 中写入每个对端机器人的准确 `open_id`；
+Hermes 不会根据显示名称猜测 ID。为保证交接事件可靠送达，原生 mention 的
+优先级高于 CardKit 流式展示。
 
 ## 交互式卡片操作
 

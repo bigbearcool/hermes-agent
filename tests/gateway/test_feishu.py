@@ -913,6 +913,75 @@ class TestFeishuAdapterMessaging(unittest.TestCase):
         self.assertNotIn("card_123", adapter._cardkit_locks)
         adapter._close_cardkit_card_before_fallback.assert_awaited_once()
 
+    def test_cardkit_edit_with_native_mention_switches_to_post(self):
+        from gateway.config import PlatformConfig
+        from plugins.platforms.feishu.adapter import FeishuAdapter
+
+        adapter = FeishuAdapter(
+            PlatformConfig(extra={"streaming_mode": "cardkit"})
+        )
+        update_method = object()
+        adapter._client = SimpleNamespace(
+            cardkit=SimpleNamespace(),
+            im=SimpleNamespace(
+                v1=SimpleNamespace(
+                    message=SimpleNamespace(update=update_method),
+                )
+            ),
+        )
+        adapter._cardkit_sequences["card_123"] = 3
+        adapter._cardkit_locks["card_123"] = asyncio.Lock()
+        adapter._close_cardkit_card_before_fallback = AsyncMock()
+        adapter._run_blocking = AsyncMock(
+            return_value=SimpleNamespace(success=lambda: True)
+        )
+
+        result = asyncio.run(
+            adapter.edit_message(
+                chat_id="oc_chat",
+                message_id="cardkit:card_123:om_123",
+                content=(
+                    '<at user_id="ou_peer_bot">Peer Bot</at> '
+                    "**please continue**"
+                ),
+                finalize=True,
+                metadata={"__hermes_streaming": True},
+            )
+        )
+
+        self.assertTrue(result.success)
+        self.assertEqual(result.message_id, "om_123")
+        adapter._close_cardkit_card_before_fallback.assert_awaited_once()
+        request = adapter._run_blocking.await_args.args[1]
+        self.assertEqual(request.request_body.msg_type, "post")
+        payload = json.loads(request.request_body.content)
+        self.assertEqual(
+            payload["zh_cn"]["content"][0][0],
+            {"tag": "at", "user_id": "ou_peer_bot"},
+        )
+        self.assertNotIn("card_123", adapter._cardkit_sequences)
+        self.assertNotIn("card_123", adapter._cardkit_locks)
+
+    def test_a2a_channel_prompt_documents_native_mention_contract(self):
+        from gateway.config import PlatformConfig
+        from plugins.platforms.feishu.adapter import FeishuAdapter
+
+        adapter = FeishuAdapter(
+            PlatformConfig(
+                extra={
+                    "allow_bots": "mentions",
+                    "channel_prompts": {"oc_chat": "Coordinate the research team."},
+                }
+            )
+        )
+        adapter._allow_bots = "mentions"
+
+        prompt = adapter._resolve_channel_prompt("oc_chat")
+
+        self.assertIn("Coordinate the research team.", prompt)
+        self.assertIn('<at user_id="ou_xxx">Bot name</at>', prompt)
+        self.assertIn("Never invent an open_id", prompt)
+
     def test_streaming_card_capabilities_are_config_gated(self):
         from gateway.config import PlatformConfig
         from plugins.platforms.feishu.adapter import FeishuAdapter
@@ -2062,6 +2131,56 @@ class TestAdapterBehavior(unittest.TestCase):
             ],
         )
 
+    @patch.dict(os.environ, {}, clear=True)
+    def test_send_with_native_mention_bypasses_cardkit(self):
+        from gateway.config import PlatformConfig
+        from plugins.platforms.feishu.adapter import FeishuAdapter
+
+        adapter = FeishuAdapter(
+            PlatformConfig(extra={"streaming_mode": "cardkit"})
+        )
+        captured = {}
+
+        class _MessageAPI:
+            def create(self, request):
+                captured["request"] = request
+                return SimpleNamespace(
+                    success=lambda: True,
+                    data=SimpleNamespace(message_id="om_handoff"),
+                )
+
+        adapter._client = SimpleNamespace(
+            im=SimpleNamespace(v1=SimpleNamespace(message=_MessageAPI()))
+        )
+        adapter._create_cardkit_card = AsyncMock()
+
+        async def _direct(func, *args, **kwargs):
+            return func(*args, **kwargs)
+
+        with patch(
+            "plugins.platforms.feishu.adapter.asyncio.to_thread",
+            side_effect=_direct,
+        ):
+            result = asyncio.run(
+                adapter.send(
+                    chat_id="oc_chat",
+                    content=(
+                        '<at user_id="ou_peer_bot">Peer Bot</at> '
+                        "**please continue**"
+                    ),
+                    metadata={"__hermes_streaming": True},
+                )
+            )
+
+        self.assertTrue(result.success)
+        adapter._create_cardkit_card.assert_not_awaited()
+        self.assertEqual(captured["request"].request_body.msg_type, "post")
+        payload = json.loads(captured["request"].request_body.content)
+        self.assertEqual(
+            payload["zh_cn"]["content"][0][0],
+            {"tag": "at", "user_id": "ou_peer_bot"},
+        )
+
 
 @unittest.skipUnless(_HAS_LARK_OAPI, "lark-oapi not installed")
 class TestHydrateBotIdentity(unittest.TestCase):
@@ -2767,6 +2886,48 @@ class TestFeishuNormalizeText(unittest.TestCase):
 
 
 class TestFeishuPostMentionParsing(unittest.TestCase):
+    def test_outbound_at_markup_builds_native_post_element(self):
+        from plugins.platforms.feishu.adapter import _build_markdown_post_payload
+
+        payload = json.loads(
+            _build_markdown_post_payload(
+                '<at user_id="ou_peer_bot">Peer Bot</at> **please continue**'
+            )
+        )
+
+        self.assertEqual(
+            payload["zh_cn"]["content"],
+            [[
+                {"tag": "at", "user_id": "ou_peer_bot"},
+                {"tag": "md", "text": " **please continue**"},
+            ]],
+        )
+
+    def test_outbound_at_markup_inside_fence_stays_literal(self):
+        from plugins.platforms.feishu.adapter import (
+            _build_markdown_post_payload,
+            _has_outbound_at_mention,
+        )
+
+        content = '```text\n<at user_id="ou_peer_bot">Peer Bot</at>\n```'
+        payload = json.loads(_build_markdown_post_payload(content))
+
+        self.assertFalse(_has_outbound_at_mention(content))
+        self.assertEqual(
+            payload["zh_cn"]["content"],
+            [[{"tag": "md", "text": content}]],
+        )
+
+    def test_plain_at_name_is_not_promoted_to_native_mention(self):
+        from gateway.config import PlatformConfig
+        from plugins.platforms.feishu.adapter import FeishuAdapter
+
+        adapter = FeishuAdapter(PlatformConfig())
+        msg_type, payload = adapter._build_outbound_payload("@Peer Bot please continue")
+
+        self.assertEqual(msg_type, "text")
+        self.assertEqual(json.loads(payload), {"text": "@Peer Bot please continue"})
+
     def test_post_at_tag_renders_via_mentions_map(self):
         """Post <at>.user_id is a placeholder ('@_user_N'); the real display
         name comes from the mentions_map lookup. Confirmed via live

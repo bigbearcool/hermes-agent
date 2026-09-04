@@ -198,8 +198,24 @@ _MARKDOWN_LINK_RE = re.compile(r"\[([^\]]+)\]\(([^)]+)\)")
 _MARKDOWN_FENCE_OPEN_RE = re.compile(r"^```([^\n`]*)\s*$")
 _MARKDOWN_FENCE_CLOSE_RE = re.compile(r"^```\s*$")
 _MENTION_RE = re.compile(r"@_user_\d+")
+# Explicit outbound mention markup.  Feishu requires a real ``at`` element in
+# a post payload for bot-to-bot handoffs; a visual ``@name`` inside markdown is
+# only text and does not emit an im.message.receive_v1 mention event.
+#
+# Keep this deliberately strict: Hermes exposes app-scoped bot/user IDs as
+# ``ou_...`` in inbound mention hints, and accepting arbitrary attributes or
+# names here would make ordinary prose capable of pinging an unintended user.
+_OUTBOUND_AT_RE = re.compile(
+    r'<at\s+user_id="(?P<user_id>ou_[A-Za-z0-9_-]+)">(?P<label>[^<\n]*)</at>'
+)
 _MULTISPACE_RE = re.compile(r"[ \t]{2,}")
 _POST_CONTENT_INVALID_RE = re.compile(r"content format of the post type is incorrect", re.IGNORECASE)
+_A2A_MENTION_PROMPT = (
+    'To trigger a real Feishu @mention when handing work to a known peer bot, '
+    'emit <at user_id="ou_xxx">Bot name</at> with that peer bot\'s exact open_id. '
+    'A plain @name is display text only and will not wake the peer bot. '
+    'Never invent an open_id; use only IDs supplied in the conversation or channel instructions.'
+)
 # ---------------------------------------------------------------------------
 # Media type sets and upload constants
 # ---------------------------------------------------------------------------
@@ -621,7 +637,7 @@ def _build_markdown_post_rows(content: str) -> List[List[Dict[str, str]]]:
     if not content:
         return [[{"tag": "md", "text": ""}]]
     if "```" not in content:
-        return [[{"tag": "md", "text": content}]]
+        return [_build_markdown_post_row(content)]
 
     rows: List[List[Dict[str, str]]] = []
     current: List[str] = []
@@ -633,7 +649,13 @@ def _build_markdown_post_rows(content: str) -> List[List[Dict[str, str]]]:
             return
         segment = "\n".join(current)
         if segment.strip():
-            rows.append([{"tag": "md", "text": segment}])
+            # A fenced block is always emitted as one markdown element.  This
+            # prevents documentation/examples containing <at ...> from
+            # accidentally notifying a real user or peer bot.
+            if _MARKDOWN_FENCE_OPEN_RE.match(segment.splitlines()[0].strip()):
+                rows.append([{"tag": "md", "text": segment}])
+            else:
+                rows.append(_build_markdown_post_row(segment))
         current = []
 
     for raw_line in content.splitlines():
@@ -656,7 +678,39 @@ def _build_markdown_post_rows(content: str) -> List[List[Dict[str, str]]]:
         current.append(raw_line)
 
     _flush_current()
-    return rows or [[{"tag": "md", "text": content}]]
+    return rows or [_build_markdown_post_row(content)]
+
+
+def _build_markdown_post_row(content: str) -> List[Dict[str, str]]:
+    """Convert explicit outbound mention markup into native Feishu elements."""
+    elements: List[Dict[str, str]] = []
+    cursor = 0
+    for match in _OUTBOUND_AT_RE.finditer(content):
+        if match.start() > cursor:
+            elements.append({"tag": "md", "text": content[cursor:match.start()]})
+        elements.append({"tag": "at", "user_id": match.group("user_id")})
+        cursor = match.end()
+    if cursor < len(content):
+        elements.append({"tag": "md", "text": content[cursor:]})
+    return elements or [{"tag": "md", "text": content}]
+
+
+def _has_outbound_at_mention(content: str) -> bool:
+    """Return True for a complete native mention outside fenced code blocks."""
+    in_code_block = False
+    for raw_line in content.splitlines():
+        stripped = raw_line.strip()
+        is_fence = bool(
+            _MARKDOWN_FENCE_CLOSE_RE.match(stripped)
+            if in_code_block
+            else _MARKDOWN_FENCE_OPEN_RE.match(stripped)
+        )
+        if is_fence:
+            in_code_block = not in_code_block
+            continue
+        if not in_code_block and _OUTBOUND_AT_RE.search(raw_line):
+            return True
+    return False
 
 
 def parse_feishu_post_payload(
@@ -2791,6 +2845,7 @@ class FeishuAdapter(BasePlatformAdapter):
 
         formatted = self.format_message(content)
         chunks = self.truncate_message(formatted, self.MAX_MESSAGE_LENGTH)
+        has_outbound_mention = _has_outbound_at_mention(formatted)
         # When chunking splits a long markdown response, an individual chunk
         # can end up as plain prose that doesn't match the per-chunk hint
         # regex — so it would be sent as ``msg_type=text`` and the user would
@@ -2798,11 +2853,11 @@ class FeishuAdapter(BasePlatformAdapter):
         # client while other chunks render correctly. Lock the markdown
         # decision at the whole-message level so every chunk consistently
         # uses ``post``. See #26841.
-        prefer_post = bool(_MARKDOWN_HINT_RE.search(formatted))
+        prefer_post = has_outbound_mention or bool(_MARKDOWN_HINT_RE.search(formatted))
         last_response = None
 
         try:
-            if self._should_use_cardkit_streaming(metadata):
+            if not has_outbound_mention and self._should_use_cardkit_streaming(metadata):
                 card_id: Optional[str] = None
                 try:
                     card_id = await self._create_cardkit_card(
@@ -2891,8 +2946,11 @@ class FeishuAdapter(BasePlatformAdapter):
                     )
 
             if (
-                self._should_use_streaming_card(metadata)
-                or self._should_use_cardkit_streaming(metadata)
+                not has_outbound_mention
+                and (
+                    self._should_use_streaming_card(metadata)
+                    or self._should_use_cardkit_streaming(metadata)
+                )
             ):
                 response = await self._feishu_send_with_retry(
                     chat_id=chat_id,
@@ -2965,8 +3023,19 @@ class FeishuAdapter(BasePlatformAdapter):
             return SendResult(success=False, error="Not connected")
 
         content = self.format_message(content)
+        has_outbound_mention = _has_outbound_at_mention(content)
         try:
             parsed_cardkit = self._parse_cardkit_message_id(message_id)
+            if parsed_cardkit and has_outbound_mention:
+                card_id, im_message_id = parsed_cardkit
+                await self._close_cardkit_card_before_fallback(
+                    card_id,
+                    "检测到交接 @，已切换为飞书原生富文本消息。",
+                    cleanup=False,
+                )
+                self._cleanup_cardkit_state(card_id)
+                message_id = im_message_id
+                parsed_cardkit = None
             if parsed_cardkit:
                 card_id, im_message_id = parsed_cardkit
                 async with self._cardkit_lock(card_id):
@@ -3043,8 +3112,11 @@ class FeishuAdapter(BasePlatformAdapter):
                             self._cleanup_cardkit_state(card_id)
 
             if (
-                self._should_use_streaming_card(metadata)
-                or self._should_use_cardkit_streaming(metadata)
+                not has_outbound_mention
+                and (
+                    self._should_use_streaming_card(metadata)
+                    or self._should_use_cardkit_streaming(metadata)
+                )
             ):
                 payload = self._build_streaming_card_payload(
                     self._compose_unified_stream_content(content, metadata),
@@ -4361,7 +4433,10 @@ class FeishuAdapter(BasePlatformAdapter):
         from gateway.platforms.base import resolve_channel_prompt
         _config = getattr(self, "config", None)
         _extra = getattr(_config, "extra", None) or {}
-        return resolve_channel_prompt(_extra, chat_id, parent_id)
+        configured = resolve_channel_prompt(_extra, chat_id, parent_id)
+        if getattr(self, "_allow_bots", "none") not in {"mentions", "all"}:
+            return configured
+        return f"{configured}\n\n{_A2A_MENTION_PROMPT}" if configured else _A2A_MENTION_PROMPT
 
     async def _process_inbound_message(
         self,
@@ -5696,7 +5771,7 @@ class FeishuAdapter(BasePlatformAdapter):
         # markdown document: when a long markdown reply is split at
         # MAX_MESSAGE_LENGTH, the per-chunk regex would otherwise
         # mis-classify a plain-prose chunk as ``text``. See #26841.
-        if prefer_post or _MARKDOWN_HINT_RE.search(content):
+        if prefer_post or _has_outbound_at_mention(content) or _MARKDOWN_HINT_RE.search(content):
             return "post", _build_markdown_post_payload(content)
         text_payload = {"text": content}
         return "text", json.dumps(text_payload, ensure_ascii=False)
