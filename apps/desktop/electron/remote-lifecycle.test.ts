@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict'
 import { exec as execCallback, spawn } from 'node:child_process'
-import { chmod, mkdir, mkdtemp, readFile, rm, symlink, writeFile } from 'node:fs/promises'
+import { access, chmod, mkdir, mkdtemp, readFile, rm, symlink, writeFile } from 'node:fs/promises'
 import os from 'node:os'
 import path from 'node:path'
 import { promisify } from 'node:util'
@@ -854,6 +854,7 @@ done
     })
 
     await exec(command, { shell: '/bin/bash' })
+    await access(path.join(directory, 'home', '.hermes-update-in-progress.mutex'))
 
     for (let attempt = 0; attempt < 40; attempt += 1) {
       try {

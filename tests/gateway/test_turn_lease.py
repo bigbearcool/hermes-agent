@@ -162,6 +162,15 @@ async def test_agent_path_propagates_timed_out_lease_before_loading_transcript(
 
     runner = _bootstrap(monkeypatch, tmp_path)
     runner._turn_leases = SessionTurnLeaseRegistry()
+
+    async def _inline_to_thread(func, /, *args, **kwargs):
+        return func(*args, **kwargs)
+
+    # This assertion times the turn-lease budget, not admission to the process
+    # default executor. Under the full parallel suite, an unrelated Telegram
+    # topic-recovery ``to_thread`` can wait behind saturated workers before the
+    # lease code is reached at all.
+    monkeypatch.setattr(asyncio, "to_thread", _inline_to_thread)
     holder = await runner._turn_leases.acquire(
         "sess-dedup", owner_key="holder-key", generation=1, timeout=1
     )

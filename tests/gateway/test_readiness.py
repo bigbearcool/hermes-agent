@@ -29,14 +29,15 @@ def test_collect_runtime_readiness_reports_healthy_local_runtime(tmp_path, monke
         active_api_runs=2,
     )
 
-    assert result["status"] == "ok"
     assert result["checks"]["state_db"]["status"] == "ok"
     assert result["checks"]["session_store"]["status"] == "ok"
     assert result["checks"]["config"]["status"] == "ok"
     assert result["checks"]["model"]["status"] == "ok"
     assert result["checks"]["gateway"]["status"] == "ok"
     assert result["checks"]["background_queues"]["active_api_runs"] == 2
-    assert result["checks"]["disk"]["status"] in {"ok", "degraded"}
+    disk_status = result["checks"]["disk"]["status"]
+    assert disk_status in {"ok", "degraded"}
+    assert result["status"] == ("degraded" if disk_status == "degraded" else "ok")
 
 
 def test_collect_runtime_readiness_degrades_on_invalid_config_and_stopped_gateway(
@@ -91,5 +92,4 @@ def test_readiness_uses_running_session_store_state_over_independent_probe(
         },
     )
     assert recovered["checks"]["session_store"] == {"status": "ok"}
-
 
