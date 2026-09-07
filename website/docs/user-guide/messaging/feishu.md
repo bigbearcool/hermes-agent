@@ -76,6 +76,8 @@ In the Feishu developer console, go to **Permission Management** and add the fol
 | `im:message.reactions:readonly` | Receive emoji reaction events |
 | `admin:app.info:readonly` | Auto-detect bot identity for @mention gating |
 | `contact:user.id:readonly` | Resolve user IDs for allowlist matching |
+| `im:message.group_at_msg.include_bot:readonly` | Receive group messages where another bot @mentions Hermes (required for Bot-to-Bot messaging) |
+| `application:bot.basic_info:read` | Resolve peer bot display names |
 
 ### Configure Events
 
@@ -273,7 +275,22 @@ Also configurable as `feishu.allow_bots` in `config.yaml` (env wins when both ar
 
 Peer bots do not need to be added to `FEISHU_ALLOWED_USERS` — that allowlist applies to human senders only.
 
-Grant the `application:bot.basic_info:read` scope to display peer bot names; without it, peer bots still route correctly but appear as their `open_id`.
+Grant `im:message.group_at_msg.include_bot:readonly`, publish a new app version,
+and obtain tenant-admin approval before expecting another bot's @mention to
+reach Hermes. Grant `application:bot.basic_info:read` to display peer bot names;
+without it, peer bots still route correctly but appear as their `open_id`.
+
+To hand work to another bot, Hermes emits an explicit native mention:
+
+```text
+<at user_id="ou_peer_bot_open_id">Peer Bot</at> Please continue the analysis.
+```
+
+The adapter converts this markup into a Feishu `post` message with a native
+`at` element. Plain `@Peer Bot` text does not trigger the peer bot. Put each
+peer bot's exact `open_id` in the relevant channel prompt or agent Memory;
+Hermes refuses to infer an ID from a display name. Native mentions take
+priority over CardKit streaming so the handoff event is delivered reliably.
 
 ## Interactive Card Actions
 
@@ -487,6 +504,30 @@ platforms:
 |---------|-----------|---------|-------------|
 | Reconnect interval | `ws_reconnect_interval` | 120s | How long to wait between reconnection attempts |
 | Ping interval | `ws_ping_interval` | _(SDK default)_ | Frequency of WebSocket keepalive pings |
+
+## Streaming Reply Cards
+
+Feishu can keep a streamed Hermes reply in one editable card instead of
+creating multiple text messages. Configure the renderer in `config.yaml`:
+
+```yaml
+platforms:
+  feishu:
+    extra:
+      streaming_mode: cardkit
+```
+
+| Mode | Behavior |
+|------|----------|
+| _(unset)_ | Existing text/post streaming behavior |
+| `card` | One legacy interactive card, updated through the IM API |
+| `cardkit` | CardKit v2 streaming card with commentary, tool status, and the final answer in one card |
+
+`cardkit` requires the Feishu application to have CardKit create, update,
+settings, and streaming-content permissions. If CardKit is unavailable or an
+update fails, Hermes closes the incomplete CardKit card and falls back to a
+legacy interactive card. This is a behavioral setting; keep it in
+`config.yaml`, not `.env`.
 
 ## Per-Group Access Control
 

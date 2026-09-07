@@ -558,6 +558,24 @@ def _run_references_parallel(
     # Shared per-fan-out context-length cache (dict get/set is GIL-atomic).
     ctx_len_cache: dict[tuple[str, str], int | None] = {}
     cache_disabled, cache_ttl = _agent_cache_opts(agent)
+
+    def _notify_progress(idx: int) -> None:
+        nonlocal completed
+        completed += 1
+        if progress_callback is None:
+            return
+        try:
+            label = _slot_label(reference_models[idx])
+            result = results[idx]
+            status = (
+                "failed"
+                if result is not None and _is_failed_reference(result[1])
+                else "done"
+            )
+            progress_callback(completed, total, label, status=status)
+        except Exception as exc:
+            logger.debug("MoA progress_callback failed: %s", exc)
+
     try:
         for idx, slot in enumerate(reference_models):
             if slot.get("provider") == "moa":
@@ -569,6 +587,10 @@ def _run_references_parallel(
                 cache_disabled=cache_disabled, cache_ttl=cache_ttl,
             )] = idx
 
+        for idx, result in enumerate(results):
+            if result is not None:
+                _notify_progress(idx)
+
         # Collect every reference (no early exit except a user interrupt).
         pending = set(futures)
         while pending:
@@ -576,12 +598,7 @@ def _run_references_parallel(
             for future in done:
                 idx = futures[future]
                 results[idx] = future.result()
-                completed += 1
-                if progress_callback is not None:
-                    try:
-                        progress_callback(completed, total, _slot_label(reference_models[idx]))
-                    except Exception as exc:  # pragma: no cover - display must never break
-                        logger.debug("MoA progress_callback failed: %s", exc)
+                _notify_progress(idx)
             if pending and agent is not None and getattr(agent, "_interrupt_requested", False):
                 interrupted = True
                 _settle_interrupted(futures, results, reference_models, late_accounting_sink)
@@ -1194,11 +1211,23 @@ class MoAChatCompletions:
         A preset MAY cap ADVISOR output (dominant MoA latency); the acting aggregator
         is never capped. None timeout = inherit auxiliary.moa_reference.timeout.
         """
+        reference_labels = [_slot_label(slot) for slot in reference_models]
+        if reference_labels:
+            self._emit(
+                "moa.phase",
+                phase="reference",
+                refs_done=0,
+                refs_total=len(reference_labels),
+                reference_labels=reference_labels,
+                aggregator=_slot_label(aggregator),
+            )
         raw_reference_timeout = preset.get("reference_timeout")
         reference_outputs = _run_references_parallel(
             reference_models, ref_messages, temperature=_preset_temperature(preset, "reference_temperature"),
-
-            progress_callback=lambda done, total, label: self._emit("moa.progress", refs_done=done, refs_total=total, label=label),
+            max_tokens=preset.get("reference_max_tokens"),
+            progress_callback=lambda done, total, label, status="done": self._emit(
+                "moa.progress", refs_done=done, refs_total=total, label=label, status=status
+            ),
             reference_timeout=float(raw_reference_timeout) if raw_reference_timeout else None,
             agent=self._agent, late_accounting_sink=self._record_late_reference_accounting,
         )
@@ -1352,8 +1381,8 @@ class MoAClient:
 # The callback signature is ``cb(event, label, text, None, **moa_*)``.
 _RELAY_EVENTS: dict[str, tuple[str, str | None, dict[str, str]]] = {
     "moa.reference": ("label", "text", {"moa_index": "index", "moa_count": "count"}),
-    "moa.progress": ("label", None, {"moa_refs_done": "refs_done", "moa_refs_total": "refs_total"}),
-    "moa.phase": ("aggregator", None, {"moa_phase": "phase", "moa_refs_done": "refs_done", "moa_refs_total": "refs_total"}),
+    "moa.progress": ("label", None, {"moa_refs_done": "refs_done", "moa_refs_total": "refs_total", "moa_status": "status"}),
+    "moa.phase": ("aggregator", None, {"moa_phase": "phase", "moa_refs_done": "refs_done", "moa_refs_total": "refs_total", "moa_reference_labels": "reference_labels"}),
     "moa.aggregating": ("aggregator", None, {"moa_ref_count": "ref_count"}),
 }
 

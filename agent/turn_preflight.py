@@ -28,6 +28,18 @@ from agent.turn_context_compaction import (
 logger = logging.getLogger("agent.conversation_loop")
 
 
+def _proactive_compression_deferred_for_visible_stream(agent: Any) -> bool:
+    """Fail-open presentation guard for optional compression only."""
+    callback = getattr(agent, "compression_defer_callback", None)
+    if not callable(callback):
+        return False
+    try:
+        return callback() is True
+    except Exception:
+        logger.debug("compression defer callback failed; continuing normally", exc_info=True)
+        return False
+
+
 @dataclass
 class PreflightGateVerdict:
     """``action``: ``"fallthrough"`` (make the API call), ``"continue"`` (window grown or
@@ -90,8 +102,20 @@ def run_preflight_compression(
         and len(v.messages) > 1
         and v.compression_attempts < max_compression_attempts
     )
+    _visible_stream_blocks_proactive_compression = (
+        not provider_overflow_preflight
+        and _proactive_compression_deferred_for_visible_stream(agent)
+    )
+    if _eligible and _visible_stream_blocks_proactive_compression:
+        logger.info(
+            "Deferring pre-API compression until the visible stream completes "
+            "(session=%s, tokens=~%s)",
+            agent.session_id or "none",
+            f"{request_pressure_tokens:,}",
+        )
     if (
         _eligible
+        and not _visible_stream_blocks_proactive_compression
         and not _review_fork_first_request_pending(agent)
         and (not v._preflight_compression_blocked or provider_overflow_preflight)
         and (not defer_preflight(request_pressure_tokens) or provider_overflow_preflight)
@@ -285,7 +309,17 @@ def compress_after_tool_results(
             estimate_request_tokens_rough(messages, tools=agent.tools or None),
         )
 
-    if (
+    _visible_stream_blocks_proactive_compression = (
+        _proactive_compression_deferred_for_visible_stream(agent)
+    )
+    if _visible_stream_blocks_proactive_compression:
+        logger.info(
+            "Deferring post-tool compression until the visible stream completes "
+            "(session=%s, tokens=~%s)",
+            agent.session_id or "none",
+            f"{_real_tokens:,}",
+        )
+    elif (
         agent.compression_enabled
         and compression_attempts < max_compression_attempts
         and not bool(

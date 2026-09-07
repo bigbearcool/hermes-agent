@@ -27,12 +27,13 @@ class StreamTransportMixin:
         # Contract: adapters must accept finalize= even when False (test-guarded).
         kwargs = dict(chat_id=self.chat_id, message_id=message_id, content=content,
                       finalize=finalize)
-        if self.metadata:
+        edit_metadata = self._metadata_for_send(final=finalize)
+        if edit_metadata:
             try:
                 params = inspect.signature(self.adapter.edit_message).parameters
                 if "metadata" in params or any(
                     param.kind is inspect.Parameter.VAR_KEYWORD for param in params.values()):
-                    kwargs["metadata"] = self.metadata
+                    kwargs["metadata"] = edit_metadata
             except (TypeError, ValueError):
                 pass
         return await self.adapter.edit_message(**kwargs)
@@ -303,7 +304,8 @@ class StreamTransportMixin:
         text = ensure_closed_code_fences(text)
         # A bare cursor renders as a stray tofu box on some clients.
         visible_stripped = (text.replace(self.cfg.cursor, "") if self.cfg.cursor else text).strip()
-        if not visible_stripped:
+        has_unified_status = self._has_unified_status()
+        if not visible_stripped and not has_unified_status:
             # Native streams MUST still get a finalize frame (placeholder) to close
             # the thinking bubble, e.g. for a MEDIA-only response.
             if (finalize and self._use_native_streaming and self._native_stream_opened
@@ -313,7 +315,7 @@ class StreamTransportMixin:
             return True  # cursor-only / whitespace-only update
         # Don't open a new message for 1-2 tokens + cursor (rapid tool-calling): if
         # the cursor-strip edit is then rate-limited, "X ▉" stays forever.
-        if (self._message_id is None and self.cfg.cursor and self.cfg.cursor in text
+        if (not has_unified_status and self._message_id is None and self.cfg.cursor and self.cfg.cursor in text
                 and len(visible_stripped) < self._MIN_NEW_MSG_CHARS):
             return True  # too short for a standalone message — accumulate more
 
@@ -439,7 +441,11 @@ class StreamTransportMixin:
         """Edit the live preview (or replace it via fresh-final when finalizing)."""
         # REQUIRES_EDIT_FINALIZE adapters need the finalize=True edit even when
         # unchanged; everyone else short-circuits.
-        if text == self._last_sent_text and not (finalize and self._adapter_requires_finalize):
+        if (
+            text == self._last_sent_text
+            and not self._has_unified_status()
+            and not (finalize and self._adapter_requires_finalize)
+        ):
             return True
         # Fresh-final: replace a long-lived preview with a fresh message, or whenever
         # the adapter prefers it (Telegram's send path renders richer markdown).  An
