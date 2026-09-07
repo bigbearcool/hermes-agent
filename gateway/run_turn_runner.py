@@ -93,12 +93,28 @@ class TurnRunner:
             self._progress_subagent_notice(preview, kwargs)
             return
         self._progress_live_status(event_type, tool_name, args)
+        unified_status_accepted = False
+        try:
+            consumer = self._stream_consumer()
+            on_status = getattr(consumer, "on_status", None)
+            if callable(on_status):
+                unified_status_accepted = bool(on_status({
+                    "event_type": event_type,
+                    "tool_name": tool_name,
+                    "preview": preview,
+                    "args": args or {},
+                    **kwargs,
+                }))
+        except Exception as err:
+            logger.debug("unified stream status dispatch failed: %s", err)
         # "log" mode: append tool.started lines to the log queue, silent in chat. Handled before
         # the progress_queue guard because log mode runs without a chat progress queue.
         if ctx.log_queue is not None and event_type == "tool.started" and tool_name and tool_name != "_thinking":
             ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
             preview_str = f' "{preview}"' if preview else ""
             ctx.log_queue.put(f"{ts}  {tool_name}:{preview_str}".rstrip())
+        if unified_status_accepted:
+            return
         if not ctx.progress_queue or not ctx._run_still_current():
             return
         if event_type == "tool.completed" and not ctx.long_tool_hint_fired[0]:
@@ -781,7 +797,7 @@ class TurnRunner:
 
     # ── stream consumer / interim commentary wiring ─────────────────────────────────────────
 
-    def _setup_stream_consumer(self, platform_key):
+    def _setup_stream_consumer(self, platform_key, model: str = ""):
         ctx = self._ctx
         stream_consumer = None
         # The streaming-TTS consumer is created on the outer loop thread before run_sync launches;
@@ -805,9 +821,12 @@ class TurnRunner:
                     consumer_cfg, pause_typing_before_finalize = self._runner._build_stream_consumer_config(
                         ctx.source, scfg, adapter, on_missing_cursor="raise",
                     )
+                    consumer_metadata = dict(ctx._status_thread_metadata or {})
+                    if model:
+                        consumer_metadata["__hermes_stream_model"] = model
                     stream_consumer = GatewayStreamConsumer(
                         adapter=adapter, chat_id=ctx.source.chat_id, config=consumer_cfg,
-                        metadata=ctx._status_thread_metadata,
+                        metadata=consumer_metadata,
                         on_new_message=(
                             (lambda: ctx.progress_queue.put(("__reset__",))) if ctx.progress_queue is not None else None
                         ),
@@ -1102,6 +1121,10 @@ class TurnRunner:
         agent.step_callback = ctx._step_callback_sync if ctx._hooks_ref.loaded_hooks else None
         agent.stream_delta_callback = stream_delta_cb
         agent.interim_assistant_callback = interim_assistant_cb if want_interim_messages else None
+        agent.compression_defer_callback = (
+            getattr(self._stream_consumer(), "has_incomplete_visible_stream", None)
+            if self._stream_consumer() is not None else None
+        )
         agent.status_callback, agent.notice_callback = ctx._status_callback_sync, self._notice_callback_sync
         agent.notice_clear_callback = None  # sends can't be retracted
         agent.event_callback = ctx._event_callback_sync
@@ -1630,13 +1653,21 @@ class TurnRunner:
                 "run_agent resolved: model=%s provider=%s session=%s",
                 model, runtime_kwargs.get("provider"), ctx.session_key or "",
             )
+            model, runtime_kwargs = runner._apply_task_model_route(
+                ctx.message,
+                model,
+                runtime_kwargs,
+                user_config=ctx.user_config,
+                platform=ctx.source.platform.value,
+                session_key=ctx.session_key,
+            )
         except Exception as exc:
             return {"final_response": f"⚠️ Provider authentication failed: {exc}", "messages": [], "api_calls": 0, "tools": []}
         pr = runner._provider_routing
         reasoning_config = runner._resolve_session_reasoning_config(source=ctx.source, session_key=ctx.session_key, model=model)
         runner._reasoning_config = reasoning_config
         runner._service_tier = runner._resolve_session_service_tier(source=ctx.source, session_key=ctx.session_key)
-        stream_consumer, stream_delta_cb, interim_cb, want_interim = self._setup_stream_consumer(platform_key)
+        stream_consumer, stream_delta_cb, interim_cb, want_interim = self._setup_stream_consumer(platform_key, model)
         turn_route = runner._resolve_turn_agent_config(ctx.message, model, runtime_kwargs)
         agent, reused_cached_agent = self._resolve_turn_agent(
             turn_route, platform_key, combined_ephemeral, max_iterations, reasoning_config, pr,

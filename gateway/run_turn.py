@@ -157,6 +157,59 @@ class GatewayTurnMixin:
 
         return model, runtime_kwargs
 
+    def _apply_task_model_route(
+        self,
+        message: str,
+        model: str,
+        runtime_kwargs: dict,
+        *,
+        user_config: dict,
+        platform: str,
+        session_key: str | None,
+    ) -> tuple[str, dict]:
+        """Apply a configured automatic route without overriding explicit `/model`."""
+        if session_key and (getattr(self, "_session_model_overrides", {}) or {}).get(session_key):
+            return model, runtime_kwargs
+        try:
+            from gateway.task_model_routing import resolve_task_model_route
+
+            route = resolve_task_model_route(message, user_config, platform=platform)
+        except Exception:
+            logger.debug("Task model route resolution failed; retaining primary model", exc_info=True)
+            return model, runtime_kwargs
+        if route is None:
+            return model, runtime_kwargs
+
+        try:
+            from gateway.run import _resolve_runtime_agent_kwargs_for_provider
+
+            routed_runtime = _resolve_runtime_agent_kwargs_for_provider(route.provider)
+        except Exception:
+            logger.warning(
+                "Task model route ignored: route=%s provider=%s could not resolve runtime",
+                route.name,
+                route.provider,
+                exc_info=True,
+            )
+            return model, runtime_kwargs
+        if route.provider != "moa" and not routed_runtime.get("api_key"):
+            logger.warning(
+                "Task model route ignored: route=%s provider=%s has no credentials",
+                route.name,
+                route.provider,
+            )
+            return model, runtime_kwargs
+
+        logger.info(
+            "Task model route selected: route=%s model=%s provider=%s reason=%s session=%s",
+            route.name,
+            route.model,
+            route.provider,
+            route.reason,
+            session_key or "",
+        )
+        return route.model, routed_runtime
+
     def _resolve_turn_agent_config(self, user_message: str, model: str, runtime_kwargs: dict) -> dict:
         """Effective model/runtime config for one turn. With `/fast` priority on, fast-mode
         ``request_overrides`` are deep-merged OVER the per-provider ones so both reach the model."""

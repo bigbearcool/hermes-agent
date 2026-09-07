@@ -19,10 +19,321 @@ def test_stream_send_metadata_carries_original_reply_anchor():
     assert consumer._metadata_for_send(final=False) == {
         "reply_to_message_id": "456",
     }
-    assert consumer._metadata_for_send(final=True) == {
-        "reply_to_message_id": "456",
-        "notify": True,
-    }
+    final_metadata = consumer._metadata_for_send(final=True)
+    assert final_metadata["reply_to_message_id"] == "456"
+    assert final_metadata["notify"] is True
+    assert final_metadata["__hermes_stream_elapsed_seconds"] >= 0
+
+
+class TestUnifiedStreamingCard:
+    @staticmethod
+    def _adapter():
+        from gateway.config import PlatformConfig
+        from plugins.platforms.feishu.adapter import FeishuAdapter
+
+        adapter = FeishuAdapter(
+            PlatformConfig(extra={"streaming_mode": "cardkit"})
+        )
+        adapter.send = AsyncMock(
+            return_value=SimpleNamespace(
+                success=True,
+                message_id="cardkit:card_1:om_1",
+            )
+        )
+        adapter.edit_message = AsyncMock(
+            return_value=SimpleNamespace(
+                success=True,
+                message_id="cardkit:card_1:om_1",
+            )
+        )
+        return adapter
+
+    @pytest.mark.asyncio
+    async def test_status_only_update_opens_card(self):
+        adapter = self._adapter()
+        consumer = GatewayStreamConsumer(
+            adapter,
+            "oc_chat",
+            StreamConsumerConfig(edit_interval=0, buffer_threshold=1),
+        )
+
+        assert consumer.on_status(
+            {
+                "event_type": "tool.started",
+                "tool_name": "web_search",
+                "preview": "Hermes",
+            }
+        )
+        consumer.finish()
+        await consumer.run()
+
+        adapter.send.assert_awaited_once()
+        metadata = adapter.send.await_args.kwargs["metadata"]
+        assert metadata["__hermes_streaming"] is True
+        assert metadata["__hermes_stream_status"]["running"] == [
+            "⏳ Tool running: `web_search`"
+        ]
+        adapter.edit_message.assert_awaited()
+        assert adapter.edit_message.await_args.kwargs["finalize"] is True
+
+    @pytest.mark.asyncio
+    async def test_moa_lifecycle_updates_and_finalizes_one_card(self):
+        adapter = self._adapter()
+        consumer = GatewayStreamConsumer(
+            adapter,
+            "oc_chat",
+            StreamConsumerConfig(edit_interval=0, buffer_threshold=1),
+        )
+
+        events = [
+            {
+                "event_type": "moa.phase",
+                "moa_phase": "reference",
+                "moa_refs_done": 0,
+                "moa_refs_total": 2,
+                "moa_reference_labels": ["deepseek", "grok"],
+                "tool_name": "gpt-5.6-terra",
+            },
+            {
+                "event_type": "moa.progress",
+                "tool_name": "deepseek",
+                "moa_refs_done": 1,
+                "moa_refs_total": 2,
+                "moa_status": "done",
+            },
+            {
+                "event_type": "moa.progress",
+                "tool_name": "grok",
+                "moa_refs_done": 2,
+                "moa_refs_total": 2,
+                "moa_status": "done",
+            },
+            {
+                "event_type": "moa.phase",
+                "tool_name": "gpt-5.6-terra",
+                "moa_phase": "aggregator",
+                "moa_refs_done": 2,
+                "moa_refs_total": 2,
+            },
+        ]
+        for event in events:
+            assert consumer.on_status(event)
+        consumer.on_delta("最终答案")
+        consumer.finish()
+        await consumer.run()
+
+        adapter.send.assert_awaited_once()
+        final_call = adapter.edit_message.await_args_list[-1]
+        assert final_call.kwargs["finalize"] is True
+        orchestration = final_call.kwargs["metadata"][
+            "__hermes_stream_status"
+        ]["orchestration"]
+        assert orchestration["phase"] == "completed"
+        assert orchestration["aggregator"] == "gpt-5.6-terra"
+        assert orchestration["references"] == [
+            {"label": "deepseek", "status": "done"},
+            {"label": "grok", "status": "done"},
+        ]
+
+    def test_moa_reference_failure_marks_final_state_degraded(self):
+        consumer = GatewayStreamConsumer(
+            self._adapter(),
+            "oc_chat",
+            StreamConsumerConfig(edit_interval=0, buffer_threshold=1),
+        )
+        consumer._apply_status_event(
+            {
+                "event_type": "moa.phase",
+                "moa_phase": "reference",
+                "moa_refs_total": 1,
+                "moa_reference_labels": ["grok"],
+            }
+        )
+        consumer._apply_status_event(
+            {
+                "event_type": "moa.progress",
+                "tool_name": "grok",
+                "moa_refs_done": 1,
+                "moa_refs_total": 1,
+                "moa_status": "failed",
+            }
+        )
+        consumer._complete_orchestration()
+        consumer._refresh_status_metadata()
+
+        orchestration = consumer._streaming_metadata[
+            "__hermes_stream_status"
+        ]["orchestration"]
+        assert orchestration["phase"] == "degraded"
+        assert orchestration["references"] == [
+            {"label": "grok", "status": "failed"}
+        ]
+
+    @pytest.mark.asyncio
+    async def test_commentary_status_and_final_share_one_message(self):
+        adapter = self._adapter()
+        consumer = GatewayStreamConsumer(
+            adapter,
+            "oc_chat",
+            StreamConsumerConfig(edit_interval=0, buffer_threshold=1),
+        )
+
+        consumer.on_commentary("我先检查配置。")
+        assert consumer.on_status(
+            {
+                "event_type": "tool.started",
+                "tool_name": "read_file",
+                "preview": "config.yaml",
+            }
+        )
+        consumer.on_delta("最终结果。")
+        assert consumer.on_status(
+            {
+                "event_type": "tool.completed",
+                "tool_name": "read_file",
+                "duration": 0.2,
+            }
+        )
+        consumer.finish()
+        await consumer.run()
+
+        adapter.send.assert_awaited_once()
+        assert adapter.edit_message.await_count >= 1
+        all_content = [
+            adapter.send.await_args.kwargs["content"],
+            *[
+                call.kwargs["content"]
+                for call in adapter.edit_message.await_args_list
+            ],
+        ]
+        assert any(
+            "我先检查配置。" in content and "最终结果。" in content
+            for content in all_content
+        )
+        final_call = adapter.edit_message.await_args_list[-1]
+        assert final_call.kwargs["finalize"] is True
+        status = final_call.kwargs["metadata"]["__hermes_stream_status"]
+        assert status["running"] == []
+        assert status["done"] == ["✅ Tool done: `read_file` (0.2s)"]
+        assert status["calls"] == [
+            {
+                "id": "tool_call_1",
+                "round": 1,
+                "name": "read_file",
+                "status": "done",
+                "preview": "config.yaml",
+                "duration": 0.2,
+            }
+        ]
+        assert final_call.kwargs["metadata"][
+            "__hermes_stream_elapsed_seconds"
+        ] >= 0
+
+    def test_repeated_tool_names_keep_distinct_records_and_rounds(self):
+        consumer = GatewayStreamConsumer(
+            self._adapter(),
+            "oc_chat",
+            StreamConsumerConfig(edit_interval=0, buffer_threshold=1),
+        )
+
+        for duration in (0.1, 0.2):
+            consumer._apply_status_event(
+                {
+                    "event_type": "tool.started",
+                    "tool_name": "read_file",
+                }
+            )
+            consumer._apply_status_event(
+                {
+                    "event_type": "tool.completed",
+                    "tool_name": "read_file",
+                    "duration": duration,
+                }
+            )
+        consumer._refresh_status_metadata()
+
+        status = consumer._streaming_metadata["__hermes_stream_status"]
+        assert len(status["calls"]) == 2
+        assert [item["id"] for item in status["calls"]] == [
+            "tool_call_1",
+            "tool_call_2",
+        ]
+        assert [item["round"] for item in status["calls"]] == [1, 2]
+        assert [item["duration"] for item in status["calls"]] == [0.1, 0.2]
+
+    @pytest.mark.asyncio
+    async def test_each_tool_lifecycle_event_updates_the_active_card(self):
+        adapter = self._adapter()
+        consumer = GatewayStreamConsumer(
+            adapter,
+            "oc_chat",
+            StreamConsumerConfig(edit_interval=0, buffer_threshold=1),
+        )
+
+        for event in (
+            {"event_type": "tool.started", "tool_name": "read_file"},
+            {
+                "event_type": "tool.completed",
+                "tool_name": "read_file",
+                "duration": 0.1,
+            },
+            {"event_type": "tool.started", "tool_name": "web_search"},
+            {
+                "event_type": "tool.completed",
+                "tool_name": "web_search",
+                "duration": 0.2,
+            },
+        ):
+            assert consumer.on_status(event)
+        consumer.finish()
+        await consumer.run()
+
+        adapter.send.assert_awaited_once()
+        assert adapter.edit_message.await_count >= 4
+        call_counts = [
+            len(
+                call.kwargs["metadata"]["__hermes_stream_status"]["calls"]
+            )
+            for call in adapter.edit_message.await_args_list
+        ]
+        assert 1 in call_counts
+        assert 2 in call_counts
+        final_status = adapter.edit_message.await_args_list[-1].kwargs[
+            "metadata"
+        ]["__hermes_stream_status"]
+        assert [item["round"] for item in final_status["calls"]] == [1, 2]
+        assert [item["status"] for item in final_status["calls"]] == [
+            "done",
+            "done",
+        ]
+
+    @pytest.mark.asyncio
+    async def test_tool_boundary_does_not_open_second_card(self):
+        adapter = self._adapter()
+        consumer = GatewayStreamConsumer(
+            adapter,
+            "oc_chat",
+            StreamConsumerConfig(edit_interval=0, buffer_threshold=1),
+        )
+
+        consumer.on_delta("第一段。")
+        consumer.on_segment_break()
+        consumer.on_delta("第二段。")
+        consumer.finish()
+        await consumer.run()
+
+        adapter.send.assert_awaited_once()
+        contents = [
+            adapter.send.await_args.kwargs["content"],
+            *[
+                call.kwargs["content"]
+                for call in adapter.edit_message.await_args_list
+            ],
+        ]
+        assert any(
+            "第一段。" in content and "第二段。" in content
+            for content in contents
+        )
 
 
 # ── _clean_for_display unit tests ────────────────────────────────────────
@@ -119,6 +430,70 @@ class TestFinalizeCapabilityGate:
         # Finalize edit must go through even on identical content.
         picky.edit_message.assert_called_once()
         assert picky.edit_message.call_args[1]["finalize"] is True
+
+    @pytest.mark.asyncio
+    async def test_single_message_adapter_does_not_finalize_existing_card_twice(self):
+        """A CardKit-style message is closed by the got_done edit itself."""
+        adapter = MagicMock()
+        adapter.REQUIRES_EDIT_FINALIZE = True
+        adapter.edit_message = AsyncMock(return_value=SimpleNamespace(
+            success=True,
+            message_id="cardkit:card_1:msg_1",
+        ))
+        adapter.MAX_MESSAGE_LENGTH = 4096
+
+        consumer = GatewayStreamConsumer(adapter, "chat_1")
+        consumer._single_streaming_message = True
+        consumer._message_id = "cardkit:card_1:msg_1"
+        consumer._already_sent = True
+        consumer._last_sent_text = "partial"
+        consumer.on_delta("complete")
+        consumer.finish()
+
+        await consumer.run()
+
+        adapter.edit_message.assert_awaited_once()
+        assert adapter.edit_message.await_args.kwargs["finalize"] is True
+        assert consumer.final_response_sent is True
+
+    @pytest.mark.asyncio
+    async def test_single_message_adapter_finalizes_after_first_done_send(self):
+        """A response first sent on got_done still receives one closing edit."""
+        adapter = MagicMock()
+        adapter.REQUIRES_EDIT_FINALIZE = True
+        adapter.send = AsyncMock(return_value=SimpleNamespace(
+            success=True,
+            message_id="cardkit:card_1:msg_1",
+        ))
+        adapter.edit_message = AsyncMock(return_value=SimpleNamespace(
+            success=True,
+            message_id="cardkit:card_1:msg_1",
+        ))
+        adapter.MAX_MESSAGE_LENGTH = 4096
+
+        consumer = GatewayStreamConsumer(adapter, "chat_1")
+        consumer._single_streaming_message = True
+        consumer.on_delta("complete")
+        consumer.finish()
+
+        await consumer.run()
+
+        adapter.send.assert_awaited_once()
+        adapter.edit_message.assert_awaited_once()
+        assert adapter.edit_message.await_args.kwargs["finalize"] is True
+
+    def test_visible_stream_compression_guard_tracks_completion(self):
+        adapter = MagicMock()
+        adapter.MAX_MESSAGE_LENGTH = 4096
+        consumer = GatewayStreamConsumer(adapter, "chat_1")
+
+        assert consumer.has_incomplete_visible_stream() is False
+
+        consumer._message_id = "cardkit:card_1:msg_1"
+        assert consumer.has_incomplete_visible_stream() is True
+
+        consumer._final_content_delivered = True
+        assert consumer.has_incomplete_visible_stream() is False
 
 
 class TestEditMessageFinalizeSignature:
@@ -1443,7 +1818,6 @@ class TestFlushPendingSync:
         consumer.finish()
         await task
 
-
     @pytest.mark.asyncio
     async def test_flush_completes_on_oversized_buffered_prose(self):
         """Regression: oversized prose takes the overflow-split `continue`
@@ -1487,4 +1861,3 @@ class TestFlushPendingSync:
 
         consumer.finish()
         await task
-

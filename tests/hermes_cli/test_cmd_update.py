@@ -92,7 +92,21 @@ def _patch_gateway_discovery():
     """
     with patch("hermes_cli.gateway.find_gateway_pids", return_value=[]), \
          patch("hermes_cli.gateway.supports_systemd_services", return_value=False), \
-         patch("hermes_cli.gateway.find_profile_gateway_processes", return_value=[]):
+         patch("hermes_cli.gateway.find_profile_gateway_processes", return_value=[]), \
+         patch(
+             "hermes_cli.update_cmd._restart_gateway_fleet_after_update",
+             side_effect=lambda *_args, **_kwargs: update_cmd._GatewayRestartOutcome(
+                 incomplete=False,
+                 phase_errors=[],
+                 pre_restart_gateway_pids=[],
+                 restarted_services=[],
+                 failed_or_stale_units=[],
+                 relaunched_profiles=[],
+                 externally_supervised_profiles=[],
+                 killed_pids=set(),
+             ),
+         ), \
+         patch("hermes_cli.update_receipt.collect_fleet_versions", return_value=[]):
         yield
 
 
@@ -284,14 +298,10 @@ class TestCmdUpdateBranchFallback:
 
     @patch("shutil.which", return_value=None)
     @patch("subprocess.run")
-    def test_update_on_fork_checks_upstream_when_origin_up_to_date(
+    def test_update_on_fork_stays_scoped_to_origin_when_up_to_date(
         self, mock_run, _mock_which, mock_args, capsys
     ):
-        """Regression for issue #26172: forks whose local HEAD already matches
-        origin/main must still consult upstream/main before printing
-        "Already up to date!" — otherwise a fork that's caught up to its own
-        origin but behind NousResearch/hermes-agent silently misses updates.
-        """
+        """Fork updates follow the configured origin and never consult upstream."""
         from hermes_cli import main as hm
 
         mock_run.side_effect = _make_run_side_effect(
@@ -305,27 +315,16 @@ class TestCmdUpdateBranchFallback:
         ), patch.object(hm, "_sync_with_upstream_if_needed") as sync_mock:
             cmd_update(mock_args)
 
-        expected_git_cmd = (
-            ["git", "-c", "windows.appendAtomically=false"] if hm._is_windows() else ["git"]
-        )
-        sync_mock.assert_called_once_with(
-            expected_git_cmd,
-            PROJECT_ROOT,
-            assume_yes=False,
-            input_fn=None,
-        )
+        sync_mock.assert_not_called()
         captured = capsys.readouterr()
         assert "Already up to date!" in captured.out
 
     @patch("shutil.which", return_value=None)
     @patch("subprocess.run")
-    def test_yes_on_fork_without_upstream_does_not_claim_up_to_date(
+    def test_yes_on_fork_without_upstream_uses_origin_only(
         self, mock_run, _mock_which, capsys
     ):
-        """#97052 review: genuine fork, no upstream remote, HEAD == origin/main,
-        --yes. The prompt is skipped without mutating remotes, and because the
-        official repo was never consulted the completion line must not claim
-        plain "Already up to date!"."""
+        """A non-interactive fork update neither probes nor configures upstream."""
         from hermes_cli import main as hm
         from hermes_cli import update_cmd
 
@@ -352,9 +351,9 @@ class TestCmdUpdateBranchFallback:
         add_remote.assert_not_called()
         mark_skip.assert_not_called()
         captured = capsys.readouterr()
-        assert "Skipping upstream setup (non-interactive run)." in captured.out
-        assert "official repo not checked" in captured.out
-        assert "Already up to date!" not in captured.out
+        assert "Skipping upstream setup" not in captured.out
+        assert "official repo not checked" not in captured.out
+        assert "Already up to date!" in captured.out
 
     @pytest.mark.parametrize(
         ("health_after_repair", "runtime_status", "expected_runtime_checks"),
@@ -460,10 +459,10 @@ class TestCmdUpdateBranchFallback:
         finalize_receipt.assert_called_once_with("partial")
     @patch("shutil.which", return_value=None)
     @patch("subprocess.run")
-    def test_fork_upstream_sync_that_moves_head_runs_post_update_steps(
+    def test_fork_origin_noop_does_not_run_code_update_steps(
         self, mock_run, _mock_which, mock_args, capsys
     ):
-        """A fork sync that pulls code must continue through post-update work."""
+        """An origin-only no-op does not fabricate an upstream code update."""
         from hermes_cli import main as hm
         from hermes_cli import update_cmd
 
@@ -471,65 +470,25 @@ class TestCmdUpdateBranchFallback:
             branch="main", verify_ok=True, commit_count="0"
         )
 
-        # The first two reads bracket the upstream sync (aaaaaaa -> bbbbbbb:
-        # the sync moved HEAD). The NEXT two bracket the pull inside the
-        # normal update path (bbbbbbb -> ccccccc) — the head-moved no-op
-        # guard added after this PR exits 1 when that pair is equal, so the
-        # mock must show the pull advancing HEAD too.
-        shas = iter(["aaaaaaa", "bbbbbbb", "bbbbbbb", "ccccccc"])
-
         with patch.object(
             hm,
             "_get_origin_url",
             return_value="https://github.com/example/hermes-agent.git",
-        ), patch.object(
-            update_cmd,
-            "_capture_head_sha",
-            side_effect=lambda *_args, **_kwargs: next(shas, "ccccccc"),
-        ), patch(
-            # The full post-update path runs the fleet version check, which
-            # reads the REAL machine's profile gateway_state.json files —
-            # live gateways on a dev box read as STALE vs this checkout and
-            # exit 1. Pin an empty fleet: this test asserts the post-update
-            # path RUNS, not the fleet's health.
-            "hermes_cli.update_receipt.collect_fleet_versions",
-            return_value=[],
-        ), patch(
-            # Same isolation for the restart phase: without these, the real
-            # machine's live gateways enter the restart discovery, the
-            # mocked-subprocess restart phase can't verify replacements, and
-            # the fail-closed contract (#78574) exits 1 (locally the
-            # live-system guard blocks the os.kill outright).
-            "hermes_cli.gateway.find_gateway_pids",
-            return_value=[],
-        ), patch(
-            "hermes_cli.gateway.find_profile_gateway_processes",
-            return_value=[],
-        ), patch(
-            "hermes_cli.gateway._get_service_pids",
-            return_value=set(),
-        ), patch.object(
-            hm, "_sync_with_upstream_if_needed"
-        ), patch.object(
+        ), patch.object(hm, "_sync_with_upstream_if_needed") as sync_mock, patch.object(
             hm,
             "_reload_updated_runtime_modules",
-            # Reaching the reload step IS the proof the post-update path ran
-            # (the bug returned from "Already up to date!" before it). Abort
-            # the pipeline right here: everything past this point (skills
-            # sync, desktop rebuild, gateway restart, fleet check) would run
-            # for real against the host machine.
-            side_effect=SystemExit(0),
         ) as post_update_step:
-            with pytest.raises(SystemExit) as exit_info:
-                cmd_update(mock_args)
+            cmd_update(mock_args)
 
-        assert exit_info.value.code == 0
-        post_update_step.assert_called_once_with()
+        sync_mock.assert_not_called()
+        post_update_step.assert_not_called()
         captured = capsys.readouterr()
-        assert "Already up to date!" not in captured.out
+        assert "Already up to date!" in captured.out
 
     def test_update_non_interactive_runs_safe_config_migrations(self, mock_args, capsys):
         """Dashboard/web updates apply non-interactive migrations before restart."""
+        from hermes_cli import update_cmd
+
         with patch("shutil.which", return_value=None), patch(
             "subprocess.run"
         ) as mock_run, patch("builtins.input") as mock_input, patch(
@@ -544,7 +503,27 @@ class TestCmdUpdateBranchFallback:
         ), patch(
             "hermes_cli.update_cmd._run_migrate_config_fresh",
             return_value={"env_added": [], "config_added": ["new.option"]},
-        ) as migrate_config, patch("hermes_cli.main.sys") as mock_sys:
+        ) as migrate_config, patch(
+            "hermes_cli.update_receipt.collect_fleet_versions", return_value=[]
+        ), patch(
+            "hermes_cli.gateway.find_gateway_pids", return_value=[]
+        ), patch(
+            "hermes_cli.gateway.find_profile_gateway_processes", return_value=[]
+        ), patch(
+            "hermes_cli.gateway._get_service_pids", return_value=set()
+        ), patch(
+            "hermes_cli.update_cmd._restart_gateway_fleet_after_update",
+            return_value=update_cmd._GatewayRestartOutcome(
+                incomplete=False,
+                phase_errors=[],
+                pre_restart_gateway_pids=[],
+                restarted_services=[],
+                failed_or_stale_units=[],
+                relaunched_profiles=[],
+                externally_supervised_profiles=[],
+                killed_pids=set(),
+            ),
+        ), patch("hermes_cli.main.sys") as mock_sys:
             mock_sys.stdin.isatty.return_value = False
             mock_sys.stdout.isatty.return_value = False
             mock_run.side_effect = _make_run_side_effect(
@@ -841,7 +820,21 @@ class TestCmdUpdateBranchFlag:
         )
         args = SimpleNamespace(branch="bb/gui")
 
-        cmd_update(args)
+        with patch.object(
+            update_cmd,
+            "_restart_gateway_fleet_after_update",
+            return_value=update_cmd._GatewayRestartOutcome(
+                incomplete=False,
+                phase_errors=[],
+                pre_restart_gateway_pids=[],
+                restarted_services=[],
+                failed_or_stale_units=[],
+                relaunched_profiles=[],
+                externally_supervised_profiles=[],
+                killed_pids=set(),
+            ),
+        ), patch("hermes_cli.update_receipt.collect_fleet_versions", return_value=[]):
+            cmd_update(args)
 
         commands = [" ".join(str(a) for a in c.args[0]) for c in mock_run.call_args_list]
 
@@ -985,10 +978,10 @@ class TestCmdUpdateCheckBranchFlag:
 
     @patch("hermes_cli.config.detect_install_method", return_value="git")
     @patch("subprocess.run")
-    def test_check_default_main_still_prefers_upstream(
+    def test_check_default_main_uses_origin(
         self, mock_run, _mock_method, capsys
     ):
-        """No --branch (or --branch=None) preserves the upstream-then-origin probe."""
+        """No --branch compares main against origin/main only."""
         mock_run.side_effect = self._check_side_effect(
             target_branch="main", verify_ok=True, commit_count="0"
         )
@@ -997,11 +990,10 @@ class TestCmdUpdateCheckBranchFlag:
         cmd_update(args)
 
         commands = [" ".join(str(a) for a in c.args[0]) for c in mock_run.call_args_list]
-        # Should have tried upstream first.
-        assert any("fetch" in c and "upstream" in c for c in commands), commands
-        # Compare ref is upstream/main (upstream fetch succeeded).
+        assert any("fetch" in c and "origin" in c for c in commands), commands
+        assert not any("fetch" in c and "upstream" in c for c in commands), commands
         rev_list_cmds = [c for c in commands if "rev-list" in c]
-        assert any("upstream/main" in c for c in rev_list_cmds), rev_list_cmds
+        assert any("origin/main" in c for c in rev_list_cmds), rev_list_cmds
 
 
 class TestCmdUpdateZipBranchRefusal:
@@ -1114,7 +1106,22 @@ class TestNodeRuntimeNpmResolution:
              patch.object(hm, "_desktop_dist_exists", return_value=True), \
              patch.object(hm, "_run_npm_install_deterministic") as mock_npm_install, \
              patch.object(main_web_build, "_run_with_idle_timeout") as mock_idle_build, \
-             patch.object(hm, "_run_logged_subprocess") as mock_desktop_build:
+             patch.object(hm, "_run_logged_subprocess") as mock_desktop_build, \
+             patch.object(
+                 update_cmd,
+                 "_restart_gateway_fleet_after_update",
+                 return_value=update_cmd._GatewayRestartOutcome(
+                     incomplete=False,
+                     phase_errors=[],
+                     pre_restart_gateway_pids=[],
+                     restarted_services=[],
+                     failed_or_stale_units=[],
+                     relaunched_profiles=[],
+                     externally_supervised_profiles=[],
+                     killed_pids=set(),
+                 ),
+             ), \
+             patch("hermes_cli.update_receipt.collect_fleet_versions", return_value=[]):
             mock_run.side_effect = _make_run_side_effect(
                 branch="main", verify_ok=True, commit_count="1"
             )

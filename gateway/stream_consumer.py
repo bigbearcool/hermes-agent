@@ -47,6 +47,7 @@ _DONE = object()
 _NEW_SEGMENT = object()
 _COMMENTARY = object()
 _TOOL_PROGRESS = object()
+_STATUS = object()
 _FINAL_TEXT = object()
 _FLUSH = object()
 _APPROVAL_BOUNDARY = object()
@@ -86,8 +87,11 @@ class _Tick:
     got_reopen_seed: bool = False
     approval_boundary: Optional[tuple] = None  # (future, cancelled_flag)
     commentary_text: Optional[str] = None
+    got_status_update: bool = False
+    unified_commentary: bool = False
     # Set by _push_update for _finalize_turn / _end_segment.
     update_visible: bool = False
+    update_was_fresh_send: bool = False
     draft_final_fresh_send: bool = False
 
     @property
@@ -122,7 +126,10 @@ class GatewayStreamConsumer(StreamTransportMixin, StreamFallbackMixin, StreamThi
         self.adapter = adapter
         self.chat_id = chat_id
         self.cfg = config or StreamConsumerConfig()
-        self.metadata = metadata
+        self.metadata = dict(metadata or {})
+        self._streaming_metadata = self.metadata
+        self.metadata["__hermes_streaming"] = True
+        self._stream_started_at = time.monotonic()
         # Hooks (exceptions swallowed): on_new_message per fresh content bubble (next
         # tool-progress bubble goes BELOW it); on_before_finalize once (pause typing).
         self._on_new_message = on_new_message
@@ -178,6 +185,19 @@ class GatewayStreamConsumer(StreamTransportMixin, StreamFallbackMixin, StreamThi
         self._awaiting_reopen_after_boundary = False
         self._reopen_seeded_eagerly = False
 
+        self._single_streaming_message = self._resolve_single_streaming_message()
+        self._unified_status_enabled = self._resolve_unified_stream_status()
+        if not self._single_streaming_message and not self._unified_status_enabled:
+            self.metadata.pop("__hermes_streaming", None)
+        self._tool_status_running: dict[str, str] = {}
+        self._tool_status_done: list[str] = []
+        self._tool_call_serial = 0
+        self._tool_round = 0
+        self._tool_records: list[dict[str, Any]] = []
+        self._tool_records_by_id: dict[str, dict[str, Any]] = {}
+        self._tool_pending_by_name: dict[str, list[str]] = {}
+        self._orchestration_status: dict[str, Any] | None = None
+
     def _reset_message_state(self) -> None:
         """Per-message (segment) state: fresh at construction and after each segment break."""
         self._message_id: Optional[str] = None
@@ -228,6 +248,321 @@ class GatewayStreamConsumer(StreamTransportMixin, StreamFallbackMixin, StreamThi
         except Exception:
             return False
 
+    def _resolve_single_streaming_message(self) -> bool:
+        """Whether the adapter owns overflow handling inside one message."""
+        if not isinstance(self.adapter, _BasePlatformAdapter):
+            return False
+        probe = getattr(self.adapter, "supports_single_streaming_message", None)
+        if not callable(probe):
+            return False
+        try:
+            return probe(self.metadata) is True
+        except TypeError:
+            try:
+                return probe() is True
+            except Exception:
+                return False
+        except Exception:
+            return False
+
+    def _resolve_unified_stream_status(self) -> bool:
+        """Whether tool status and commentary stay in the active message."""
+        if not isinstance(self.adapter, _BasePlatformAdapter):
+            return False
+        probe = getattr(self.adapter, "supports_unified_stream_status", None)
+        if not callable(probe):
+            return False
+        try:
+            return probe(self.metadata) is True
+        except TypeError:
+            try:
+                return probe() is True
+            except Exception:
+                return False
+        except Exception:
+            return False
+
+    @property
+    def unified_status_enabled(self) -> bool:
+        return self._unified_status_enabled
+
+    def on_status(self, event: dict) -> bool:
+        """Queue structured tool or orchestration status for unified rendering."""
+        if not self._unified_status_enabled or not isinstance(event, dict):
+            return False
+        kind = str(event.get("event_type") or event.get("event") or "")
+        if kind not in {
+            "tool.started",
+            "tool.completed",
+            "tool.failed",
+            "moa.progress",
+            "moa.phase",
+            "moa.aggregating",
+        }:
+            return False
+        if str(event.get("tool_name") or event.get("name") or "") == "_thinking":
+            return False
+        self._queue.put((_STATUS, event))
+        return True
+
+    def _apply_status_event(self, event: dict) -> None:
+        kind = str(event.get("event_type") or event.get("event") or "")
+        if kind.startswith("moa."):
+            self._apply_moa_status_event(kind, event)
+            return
+        tool_name = str(event.get("tool_name") or event.get("name") or "tool")
+        if kind == "tool.started":
+            if not self._tool_status_running:
+                self._tool_round += 1
+            self._tool_call_serial += 1
+            explicit_id = str(
+                event.get("call_id") or event.get("tool_call_id") or ""
+            ).strip()
+            key = explicit_id or f"tool_call_{self._tool_call_serial}"
+            while key in self._tool_records_by_id:
+                self._tool_call_serial += 1
+                key = f"tool_call_{self._tool_call_serial}"
+            preview = str(event.get("preview") or "").strip()
+            record: dict[str, Any] = {
+                "id": key,
+                "round": max(1, self._tool_round),
+                "name": tool_name,
+                "status": "running",
+            }
+            if preview:
+                record["preview"] = preview[:160]
+            self._tool_records.append(record)
+            self._tool_records_by_id[key] = record
+            self._tool_pending_by_name.setdefault(tool_name, []).append(key)
+            self._tool_status_running[key] = (
+                f"⏳ Tool running: `{tool_name}`"
+            )
+        elif kind in {"tool.completed", "tool.failed"}:
+            explicit_id = str(
+                event.get("call_id") or event.get("tool_call_id") or ""
+            ).strip()
+            key = (
+                explicit_id
+                if explicit_id in self._tool_records_by_id
+                else ""
+            )
+            pending = self._tool_pending_by_name.get(tool_name, [])
+            if not key:
+                while pending:
+                    candidate = pending.pop(0)
+                    if candidate in self._tool_status_running:
+                        key = candidate
+                        break
+            elif key in pending:
+                pending.remove(key)
+            if not key:
+                self._tool_call_serial += 1
+                key = f"tool_call_{self._tool_call_serial}"
+                if not self._tool_round:
+                    self._tool_round = 1
+                record = {
+                    "id": key,
+                    "round": self._tool_round,
+                    "name": tool_name,
+                    "status": "running",
+                }
+                self._tool_records.append(record)
+                self._tool_records_by_id[key] = record
+            self._tool_status_running.pop(key, None)
+            failed = kind == "tool.failed" or bool(
+                event.get("is_error") or event.get("failed")
+            )
+            icon = "❌" if failed else "✅"
+            label = "Tool failed" if failed else "Tool done"
+            duration: Optional[float] = None
+            try:
+                if event.get("duration") is not None:
+                    duration = max(0.0, float(event["duration"]))
+            except (TypeError, ValueError):
+                pass
+            duration_text = (
+                f" ({duration:.1f}s)" if duration is not None else ""
+            )
+            self._tool_status_done.append(
+                f"{icon} {label}: `{tool_name}`{duration_text}"
+            )
+            record = self._tool_records_by_id[key]
+            record["status"] = "failed" if failed else "done"
+            if duration is not None:
+                record["duration"] = duration
+            self._tool_records = self._tool_records[-100:]
+            live_ids = {str(item["id"]) for item in self._tool_records}
+            self._tool_records_by_id = {
+                record_id: item
+                for record_id, item in self._tool_records_by_id.items()
+                if record_id in live_ids
+            }
+            self._tool_status_done = self._tool_status_done[-100:]
+
+    @staticmethod
+    def _status_count(value: Any, default: int = 0) -> int:
+        try:
+            return max(0, int(value))
+        except (TypeError, ValueError):
+            return default
+
+    def _apply_moa_status_event(self, kind: str, event: dict) -> None:
+        """Fold MoA lifecycle events into one stable orchestration snapshot."""
+        phase = str(event.get("moa_phase") or event.get("phase") or "").strip()
+        refs_done = self._status_count(
+            event.get("moa_refs_done", event.get("refs_done")),
+        )
+        refs_total = self._status_count(
+            event.get("moa_refs_total", event.get("refs_total")),
+        )
+        label = str(event.get("tool_name") or event.get("name") or "").strip()
+
+        if self._orchestration_status is None:
+            self._orchestration_status = {
+                "kind": "moa",
+                "phase": "references",
+                "refs_done": 0,
+                "refs_total": refs_total,
+                "references": [],
+                "aggregator": "",
+            }
+        state = self._orchestration_status
+        references = state.setdefault("references", [])
+
+        if kind == "moa.phase" and phase == "reference":
+            raw_labels = event.get("moa_reference_labels")
+            if not isinstance(raw_labels, (list, tuple)):
+                raw_labels = event.get("reference_labels")
+            labels = [
+                str(item).strip()
+                for item in (raw_labels or [])
+                if str(item).strip()
+            ]
+            state.update(
+                {
+                    "phase": "references",
+                    "refs_done": refs_done,
+                    "refs_total": refs_total or len(labels),
+                    "references": [
+                        {"label": item, "status": "running"}
+                        for item in labels
+                    ],
+                    "aggregator": label,
+                }
+            )
+            return
+
+        if kind == "moa.progress":
+            status = str(event.get("moa_status") or "done").strip().lower()
+            if status not in {"done", "failed"}:
+                status = "done"
+            record = next(
+                (
+                    item
+                    for item in references
+                    if str(item.get("label") or "") == label
+                ),
+                None,
+            )
+            if record is None and label:
+                record = {"label": label, "status": status}
+                references.append(record)
+            elif record is not None:
+                record["status"] = status
+            state["phase"] = "references"
+            state["refs_done"] = refs_done
+            state["refs_total"] = refs_total or max(
+                len(references),
+                self._status_count(state.get("refs_total")),
+            )
+            return
+
+        if kind == "moa.phase" and phase == "aggregator":
+            state["refs_done"] = refs_done
+            state["refs_total"] = refs_total or self._status_count(
+                state.get("refs_total")
+            )
+            state["aggregator"] = label
+            for record in references:
+                if record.get("status") == "running":
+                    record["status"] = "done"
+            state["phase"] = (
+                "degraded_aggregating"
+                if any(
+                    record.get("status") == "failed"
+                    for record in references
+                )
+                else "aggregating"
+            )
+            return
+
+        if kind == "moa.aggregating":
+            state["phase"] = "aggregating"
+            state["aggregator"] = label or str(state.get("aggregator") or "")
+            ref_count = self._status_count(event.get("moa_ref_count"))
+            if ref_count:
+                state["refs_done"] = ref_count
+                state["refs_total"] = ref_count
+
+    def _complete_orchestration(self) -> None:
+        state = self._orchestration_status
+        if not isinstance(state, dict):
+            return
+        references = state.get("references") or []
+        for item in references:
+            if isinstance(item, dict) and item.get("status") == "running":
+                item["status"] = "failed"
+        failed = any(
+            isinstance(item, dict) and item.get("status") == "failed"
+            for item in references
+        )
+        state["phase"] = "degraded" if failed else "completed"
+
+    def _has_unified_status(self) -> bool:
+        return bool(
+            self._unified_status_enabled
+            and (
+                self._tool_status_running
+                or self._tool_status_done
+                or self._orchestration_status
+            )
+        )
+
+    def _refresh_status_metadata(self) -> None:
+        if self._unified_status_enabled:
+            status: dict[str, Any] = {
+                "running": list(self._tool_status_running.values()),
+                "done": list(self._tool_status_done),
+                "calls": [dict(item) for item in self._tool_records],
+            }
+            if self._orchestration_status is not None:
+                status["orchestration"] = {
+                    **self._orchestration_status,
+                    "references": [
+                        dict(item)
+                        for item in self._orchestration_status.get(
+                            "references", []
+                        )
+                        if isinstance(item, dict)
+                    ],
+                }
+            self.metadata["__hermes_stream_status"] = status
+
+    def has_incomplete_visible_stream(self) -> bool:
+        """Return whether a user-visible streaming message is still open.
+
+        This method is intentionally synchronous: the agent worker uses it as
+        a best-effort guard before proactive context compression.  A message
+        ID proves the platform has already rendered the stream; completion
+        flags prove the final card/message has not landed yet.
+        """
+        return bool(
+            self._message_id
+            and not self._final_response_sent
+            and not self._final_content_delivered
+        )
+
+
     @property
     def accepts_tool_progress(self) -> bool:
         """True only when native streaming is active (gates in-stream tool progress)."""
@@ -254,6 +589,9 @@ class GatewayStreamConsumer(StreamTransportMixin, StreamFallbackMixin, StreamThi
             meta["expect_edits"] = True
         if final:
             meta["notify"] = True
+            meta["__hermes_stream_elapsed_seconds"] = max(
+                0.0, time.monotonic() - self._stream_started_at
+            )
         return meta or None
 
     # Read-only views for the gateway (flag semantics: see _clear_turn_final_flags).
@@ -543,6 +881,8 @@ class GatewayStreamConsumer(StreamTransportMixin, StreamFallbackMixin, StreamThi
 
                 if tick.got_done:
                     self._flush_think_buffer()
+                    self._complete_orchestration()
+                    self._refresh_status_metadata()
                     # A bare intentional-silence marker (NO_REPLY / [SILENT]): the
                     # gateway's whole-response filter runs too late for a streamed
                     # preview, so retract it here instead of finalizing.
@@ -551,11 +891,17 @@ class GatewayStreamConsumer(StreamTransportMixin, StreamFallbackMixin, StreamThi
                         return
 
                 if self._should_edit(tick) and (
-                    self._accumulated or (self._use_native_streaming and self._tool_progress_active)
+                    self._accumulated
+                    or self._has_unified_status()
+                    or (self._use_native_streaming and self._tool_progress_active)
                 ):
                     # Overflow split.  Native streaming bypasses this: the adapter
                     # truncates against the stream protocol's own limit.
-                    if not self._use_native_streaming and self._first_send_overflows():
+                    if (
+                        not self._single_streaming_message
+                        and not self._use_native_streaming
+                        and self._first_send_overflows()
+                    ):
                         if await self._split_first_send(tick):
                             return
                         continue
@@ -639,6 +985,11 @@ class GatewayStreamConsumer(StreamTransportMixin, StreamFallbackMixin, StreamThi
             kind = item[0] if isinstance(item, tuple) and item else None
             if kind is _FINAL_TEXT:
                 self._adopt_final_text(item[1])
+            elif kind is _STATUS:
+                self._apply_status_event(item[1])
+                self._refresh_status_metadata()
+                tick.got_status_update = True
+                return tick
             elif kind is _TOOL_PROGRESS:  # keep draining to batch simultaneous lines
                 if self._use_native_streaming:
                     self._tool_progress_lines.append(item[1])
@@ -647,7 +998,18 @@ class GatewayStreamConsumer(StreamTransportMixin, StreamFallbackMixin, StreamThi
                 tick.approval_boundary = (item[1], item[2])
                 return tick
             elif kind is _COMMENTARY:
-                tick.commentary_text = item[1]
+                if self._unified_status_enabled:
+                    cleaned = self._clean_for_display(item[1])
+                    if cleaned.strip():
+                        if self._accumulated and not self._accumulated.endswith("\n"):
+                            self._accumulated += "\n\n"
+                            self._stream_ledger += "\n\n"
+                        addition = cleaned.rstrip() + "\n\n"
+                        self._accumulated += addition
+                        self._stream_ledger += addition
+                        tick.unified_commentary = True
+                else:
+                    tick.commentary_text = item[1]
                 return tick
             elif kind is _FLUSH:
                 # Barrier: finalize like a tool boundary, signal at the end of the tick.
@@ -695,18 +1057,21 @@ class GatewayStreamConsumer(StreamTransportMixin, StreamFallbackMixin, StreamThi
 
     def _should_edit(self, tick: "_Tick") -> bool:
         """Decide whether this tick flushes an edit/frame."""
+        if tick.got_status_update or tick.unified_commentary:
+            return True
         if not tick.is_interim:
             return True
-        if self.cfg.buffer_only:
+        has_unified_status = self._has_unified_status()
+        if self.cfg.buffer_only and not has_unified_status:
             return False
         if self._use_native_streaming:
             # No platform edit-rate limit: push every delta immediately.
-            should_edit = bool(self._accumulated) or self._tool_progress_active
+            should_edit = bool(self._accumulated) or self._tool_progress_active or has_unified_status
         else:
             elapsed = time.monotonic() - self._last_edit_time
             # buffer_threshold is a codepoint debounce heuristic, not a
             # platform-limit check (_len_fn is for overflow).
-            should_edit = bool((elapsed >= self._current_edit_interval and self._accumulated)
+            should_edit = bool((elapsed >= self._current_edit_interval and (self._accumulated or has_unified_status))
                                or len(self._accumulated) >= self.cfg.buffer_threshold)
         # Defer mid-stream edits while the buffer could still resolve to a silence
         # marker ("NO"→"NO_REPLY"); got_done always resolves the buffer.
@@ -769,7 +1134,12 @@ class GatewayStreamConsumer(StreamTransportMixin, StreamFallbackMixin, StreamThi
 
     async def _seal_overflow_heads(self) -> None:
         """Existing message overflowing: seal it with the head, start a new message for the rest."""
-        while self._overflows() and self._message_id is not None and self._edit_supported:
+        while (
+            not self._single_streaming_message
+            and self._overflows()
+            and self._message_id is not None
+            and self._edit_supported
+        ):
             cp_budget = _custom_unit_to_cp(self._accumulated, self._safe_limit, self._len_fn)
             split_at = self._accumulated.rfind("\n", 0, cp_budget)
             if split_at < cp_budget // 2:
@@ -789,6 +1159,8 @@ class GatewayStreamConsumer(StreamTransportMixin, StreamFallbackMixin, StreamThi
     async def _push_update(self, tick: "_Tick") -> None:
         """Send/edit this tick's visible text (cursor-suffixed unless finalizing)."""
         display_text = self._accumulated
+        if not display_text and self._has_unified_status():
+            display_text = self.cfg.cursor or " "
         if tick.is_interim:
             if self._use_native_streaming:
                 display_text = self._compose_frame_content()
@@ -804,6 +1176,7 @@ class GatewayStreamConsumer(StreamTransportMixin, StreamFallbackMixin, StreamThi
         # Segment break finalizes so platforms needing explicit closure (DingTalk AI
         # Cards) don't leave the segment stuck loading; it closes a preamble, not the
         # answer.
+        tick.update_was_fresh_send = self._message_id is None
         tick.update_visible = await self._send_or_edit(
             display_text, finalize=tick.got_done or tick.got_segment_break,
             is_turn_final=tick.got_done)
@@ -813,7 +1186,7 @@ class GatewayStreamConsumer(StreamTransportMixin, StreamFallbackMixin, StreamThi
 
     async def _finalize_turn(self, tick: "_Tick") -> None:
         """got_done: final edit without cursor, or one continuation send if edits failed."""
-        if self._accumulated or self._message_id is not None or self._already_sent:
+        if self._accumulated or self._has_unified_status() or self._message_id is not None or self._already_sent:
             await self._notify_before_finalize()
         if self._reopen_seed_pending() and not self._accumulated:
             # Lazy reopen, no post-prompt content: nothing is open on screen, so
@@ -834,7 +1207,7 @@ class GatewayStreamConsumer(StreamTransportMixin, StreamFallbackMixin, StreamThi
                 await self._finalize_edit(self._accumulated or "✅", record=False)
             else:
                 self._mark_final_delivered()
-        elif self._accumulated:
+        elif self._accumulated or self._has_unified_status():
             await self._finalize_edit_path(tick)
 
     async def _finalize_edit_path(self, tick: "_Tick") -> None:
@@ -844,7 +1217,8 @@ class GatewayStreamConsumer(StreamTransportMixin, StreamFallbackMixin, StreamThi
         elif self._final_response_sent:
             # Fresh-final already delivered; a second finalize would duplicate.
             self._mark_final_delivered(record=self._accumulated)
-        elif tick.update_visible and (not self._adapter_requires_finalize
+        elif tick.update_visible and ((self._single_streaming_message and not tick.update_was_fresh_send)
+                                      or not self._adapter_requires_finalize
                                       or self._last_edit_overflowed or tick.draft_final_fresh_send):
             # The update already delivered the final.  A second finalize would re-edit
             # it (Telegram: editMessageText after sendRichMessage falls back to the
@@ -871,7 +1245,7 @@ class GatewayStreamConsumer(StreamTransportMixin, StreamFallbackMixin, StreamThi
     def _cumulative_transport(self) -> bool:
         """Stream-is-the-message drafts and WeCom native: one append-only stream per turn."""
         stream_draft = self._stream_is_message() and self._use_draft_streaming
-        return stream_draft or self._use_native_streaming
+        return self._single_streaming_message or stream_draft or self._use_native_streaming
 
     async def _deliver_commentary(self, commentary_text: str) -> None:
         """Post commentary as its own message.  Cumulative transports keep the stream going —

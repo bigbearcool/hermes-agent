@@ -156,6 +156,11 @@ class TestPostToolCompressionAttemptCap:
         agent.context_compressor.awaiting_real_usage_after_compression = True
 
         result, compress_calls = _run_tool_loop(agent, n_tool_iterations=1)
+    def test_post_tool_compression_waits_for_visible_stream(self, agent):
+        """Proactive compaction must not stall an already-visible card."""
+        agent.compression_defer_callback = lambda: True
+
+        result, compress_calls = _run_tool_loop(agent, n_tool_iterations=3)
 
         assert result["completed"] is True
         assert compress_calls == []
