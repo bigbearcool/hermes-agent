@@ -333,6 +333,37 @@ class TestFeishuAdapterMessaging(unittest.TestCase):
         self.assertIn("⏳ `web_search`", streaming)
         self.assertIn("正在整理结果", streaming)
 
+        compact_final = FeishuAdapter._compose_unified_stream_content(
+            "最终答案",
+            {
+                "__hermes_stream_status": {
+                    "running": [],
+                    "done": ["✅ Tool done: `read_file`"],
+                    "calls": [
+                        {
+                            "id": "call_1",
+                            "round": 1,
+                            "name": "read_file",
+                            "status": "done",
+                            "duration": 0.2,
+                        },
+                        {
+                            "id": "call_2",
+                            "round": 2,
+                            "name": "web_search",
+                            "status": "done",
+                            "duration": 0.3,
+                        },
+                    ],
+                }
+            },
+            finalize=True,
+        )
+        self.assertIn("🔧 工具调用：2 项（已收起）", compact_final)
+        self.assertNotIn("`read_file`", compact_final)
+        self.assertNotIn("`web_search`", compact_final)
+        self.assertIn("最终答案", compact_final)
+
         final = FeishuAdapter._build_final_cardkit_card(
             "最终答案",
             tool_status={
@@ -999,9 +1030,14 @@ class TestFeishuAdapterMessaging(unittest.TestCase):
 
         self.assertFalse(plain.supports_single_streaming_message())
         self.assertFalse(plain.REQUIRES_EDIT_FINALIZE)
+        self.assertFalse(plain.supports_unified_stream_status())
         self.assertTrue(card.supports_single_streaming_message())
         self.assertTrue(card.REQUIRES_EDIT_FINALIZE)
-        self.assertFalse(card.supports_unified_stream_status())
+        # Card mode edits one interactive card in place (im.message.patch), so tool /
+        # completion status must fold into that same card rather than spawn a separate
+        # progress bubble.  Regression: it was gated on CardKit only, leaking tool
+        # section cards for ``streaming_mode: card`` (two cards on screen).
+        self.assertTrue(card.supports_unified_stream_status())
         self.assertTrue(cardkit.supports_single_streaming_message())
         self.assertTrue(cardkit.REQUIRES_EDIT_FINALIZE)
         self.assertTrue(cardkit.supports_unified_stream_status())

@@ -1484,9 +1484,16 @@ class FeishuAdapter(BasePlatformAdapter):
         self,
         metadata: Optional[Dict[str, Any]] = None,
     ) -> bool:
-        """Render commentary and tool status inside the active CardKit card."""
-        return self._should_use_cardkit_streaming(
-            metadata or {self._STREAMING_METADATA_KEY: True}
+        """Render commentary and tool status inside the single active streaming card.
+
+        Both card-mode (im.message.patch on one interactive card) and CardKit-mode share the
+        same unified single-card renderer, so tool/completion status should be folded into that
+        one card for either mode. Gating on CardKit alone made ``card`` mode leak tool progress
+        into a separate bubble/card (two cards on screen)."""
+        probe = metadata or {self._STREAMING_METADATA_KEY: True}
+        return (
+            self._should_use_cardkit_streaming(probe)
+            or self._should_use_streaming_card(probe)
         )
 
     @classmethod
@@ -1740,23 +1747,50 @@ class FeishuAdapter(BasePlatformAdapter):
         return "\n\n".join(sections)
 
     @classmethod
+    def _final_unified_stream_summary(
+        cls,
+        status: Optional[Dict[str, Any]],
+    ) -> str:
+        """Return the compact final-state summary for ordinary streaming cards.
+
+        During execution the card exposes individual tool calls so the user can see progress.
+        Once finalized, ordinary interactive cards should not retain that unbounded trace; the
+        CardKit renderer has a real collapsible panel, while the compatible card path keeps a
+        single collapsed summary line.
+        """
+        records = cls._unified_stream_call_records(status)
+        count = len(records)
+        if not count and isinstance(status, dict):
+            count = len(
+                [item for item in status.get("done", []) if str(item).strip()]
+            )
+        if not count:
+            return ""
+        return f"🔧 工具调用：{count} 项（已收起）"
+
+    @classmethod
     def _compose_unified_stream_content(
         cls,
         content: str,
         metadata: Optional[Dict[str, Any]],
+        *,
+        finalize: bool = False,
     ) -> str:
         if not isinstance(metadata, dict):
             return content
         status = metadata.get("__hermes_stream_status")
-        progress_sections = [
-            section
-            for section in (
-                cls._format_moa_orchestration(status, streaming=True),
-                cls._format_tool_call_rounds(status, streaming=True),
-            )
-            if section
-        ]
-        progress_section = "\n\n".join(progress_sections)
+        if finalize:
+            progress_section = cls._final_unified_stream_summary(status)
+        else:
+            progress_sections = [
+                section
+                for section in (
+                    cls._format_moa_orchestration(status, streaming=True),
+                    cls._format_tool_call_rounds(status, streaming=True),
+                )
+                if section
+            ]
+            progress_section = "\n\n".join(progress_sections)
         if not progress_section:
             return content or ""
         if not content:
@@ -2816,7 +2850,11 @@ class FeishuAdapter(BasePlatformAdapter):
                 )
             ):
                 payload = self._build_streaming_card_payload(
-                    self._compose_unified_stream_content(content, metadata),
+                    self._compose_unified_stream_content(
+                        content,
+                        metadata,
+                        finalize=finalize,
+                    ),
                     finalize=finalize,
                 )
                 body = self._build_patch_message_body(content=payload)
