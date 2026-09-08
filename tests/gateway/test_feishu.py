@@ -364,6 +364,17 @@ class TestFeishuAdapterMessaging(unittest.TestCase):
         self.assertNotIn("`web_search`", compact_final)
         self.assertIn("最终答案", compact_final)
 
+        compatible_final_with_footer = FeishuAdapter._compose_unified_stream_content(
+            "最终答案",
+            {
+                "__hermes_stream_model": "gpt-5.6-terra-900k",
+                "__hermes_stream_elapsed_seconds": 2.25,
+            },
+            finalize=True,
+        )
+        self.assertIn("🤖 gpt-5.6-terra-900k", compatible_final_with_footer)
+        self.assertIn("⏱ 2.2s", compatible_final_with_footer)
+
         final = FeishuAdapter._build_final_cardkit_card(
             "最终答案",
             tool_status={

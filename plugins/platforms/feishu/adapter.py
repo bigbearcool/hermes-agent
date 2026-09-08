@@ -1791,11 +1791,20 @@ class FeishuAdapter(BasePlatformAdapter):
                 if section
             ]
             progress_section = "\n\n".join(progress_sections)
-        if not progress_section:
-            return content or ""
-        if not content:
-            return progress_section
-        return f"{progress_section}\n\n---\n\n{content}"
+        footer = ""
+        if finalize:
+            footer_parts: List[str] = []
+            model_name = str(metadata.get("__hermes_stream_model") or "").strip()
+            if model_name:
+                footer_parts.append(f"🤖 {model_name}")
+            elapsed_seconds = metadata.get("__hermes_stream_elapsed_seconds")
+            if isinstance(elapsed_seconds, (int, float)) and not isinstance(elapsed_seconds, bool):
+                footer_parts.append(f"⏱ {max(0.0, float(elapsed_seconds)):.1f}s")
+            if footer_parts:
+                footer = " · ".join(footer_parts)
+
+        sections = [section for section in (progress_section, content or "", footer) if section]
+        return "\n\n---\n\n".join(sections)
 
     @classmethod
     def _strip_status_only_stream_cursor(
