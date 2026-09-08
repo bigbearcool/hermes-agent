@@ -71,7 +71,8 @@ class FinalizeCaptureAdapter(BasePlatformAdapter):
                 "message_id": message_id,
                 "content": content,
                 "finalize": finalize,
-            }
+                "metadata": metadata,
+            },
         )
         return SendResult(success=True, message_id=message_id)
 
@@ -83,6 +84,105 @@ class FinalizeCaptureAdapter(BasePlatformAdapter):
 
     async def get_chat_info(self, chat_id: str):
         return {"id": chat_id}
+
+
+@pytest.mark.asyncio
+async def test_streamed_reconciliation_edit_preserves_stream_metadata():
+    """Final reconciliation must remain on the streaming card transport."""
+    adapter = FinalizeCaptureAdapter()
+    runner = object.__new__(importlib.import_module("gateway.run").GatewayRunner)
+    stream_metadata = {"__hermes_streaming": True}
+    consumer = SimpleNamespace(
+        adapter=adapter,
+        message_id="om_stream",
+        metadata=stream_metadata,
+    )
+    response = {}
+
+    await runner._run_agent_edit_streamed_message(
+        consumer,
+        SimpleNamespace(chat_id="oc_chat"),
+        response,
+        "complete final response",
+        _sk="feishu-card-reconcile",
+        ok=("edited %s", "om_stream"),
+        fail_result="edit failed for %s (%s)",
+        fail_exc="edit raised for %s: %s",
+    )
+
+    assert response["already_sent"] is True
+    assert adapter.edits[-1]["message_id"] == "om_stream"
+    assert adapter.edits[-1]["finalize"] is True
+    assert adapter.edits[-1]["metadata"] == stream_metadata
+
+
+@pytest.mark.asyncio
+async def test_streamed_reconciliation_edit_omits_unsupported_metadata():
+    """Final reconciliation keeps adapters with the legacy edit signature working."""
+    edits = []
+
+    class LegacyEditAdapter:
+        async def edit_message(self, chat_id, message_id, content, *, finalize=False):
+            edits.append((chat_id, message_id, content, finalize))
+            return SendResult(success=True, message_id=message_id)
+
+    runner = object.__new__(importlib.import_module("gateway.run").GatewayRunner)
+    response = {}
+    consumer = SimpleNamespace(
+        adapter=LegacyEditAdapter(),
+        message_id="legacy-stream",
+        metadata={"__hermes_streaming": True},
+    )
+
+    await runner._run_agent_edit_streamed_message(
+        consumer,
+        SimpleNamespace(chat_id="legacy-chat"),
+        response,
+        "complete final response",
+        _sk="legacy-reconcile",
+        ok=("edited %s", "legacy-stream"),
+        fail_result="edit failed for %s (%s)",
+        fail_exc="edit raised for %s: %s",
+    )
+
+    assert response["already_sent"] is True
+    assert edits == [("legacy-chat", "legacy-stream", "complete final response", True)]
+
+
+@pytest.mark.asyncio
+async def test_streamed_reconciliation_edit_passes_metadata_to_kwargs_adapter():
+    """Adapters accepting arbitrary keyword arguments retain streaming metadata."""
+    edits = []
+
+    class KwargsEditAdapter:
+        async def edit_message(self, chat_id, message_id, content, *, finalize=False, **kwargs):
+            edits.append((chat_id, message_id, content, finalize, kwargs))
+            return SendResult(success=True, message_id=message_id)
+
+    runner = object.__new__(importlib.import_module("gateway.run").GatewayRunner)
+    stream_metadata = {"__hermes_streaming": True}
+    response = {}
+    consumer = SimpleNamespace(
+        adapter=KwargsEditAdapter(),
+        message_id="kwargs-stream",
+        metadata=stream_metadata,
+    )
+
+    await runner._run_agent_edit_streamed_message(
+        consumer,
+        SimpleNamespace(chat_id="kwargs-chat"),
+        response,
+        "complete final response",
+        _sk="kwargs-reconcile",
+        ok=("edited %s", "kwargs-stream"),
+        fail_result="edit failed for %s (%s)",
+        fail_exc="edit raised for %s: %s",
+    )
+
+    assert response["already_sent"] is True
+    assert edits == [
+        ("kwargs-chat", "kwargs-stream", "complete final response", True, {"metadata": stream_metadata})
+    ]
 
 
 STREAMED_PREFIX = "The photo shows a dog on a beach"

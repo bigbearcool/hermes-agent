@@ -475,12 +475,12 @@ class TestFeishuAdapterMessaging(unittest.TestCase):
         adapter = FeishuAdapter(
             PlatformConfig(extra={"streaming_mode": "cardkit"})
         )
-        update_method = object()
+        patch_method = object()
         adapter._client = SimpleNamespace(
             cardkit=SimpleNamespace(),
             im=SimpleNamespace(
                 v1=SimpleNamespace(
-                    message=SimpleNamespace(update=update_method),
+                    message=SimpleNamespace(patch=patch_method),
                 )
             ),
         )
@@ -494,8 +494,8 @@ class TestFeishuAdapterMessaging(unittest.TestCase):
         )
         adapter._close_cardkit_card_before_fallback = AsyncMock()
         adapter._feishu_send_with_retry = AsyncMock(return_value=response)
-        adapter._build_update_message_body = MagicMock(return_value="body")
-        adapter._build_update_message_request = MagicMock(
+        adapter._build_patch_message_body = MagicMock(return_value="body")
+        adapter._build_patch_message_request = MagicMock(
             return_value=SimpleNamespace(message_id="om_123")
         )
         adapter._run_blocking = AsyncMock(return_value=response)
@@ -513,7 +513,7 @@ class TestFeishuAdapterMessaging(unittest.TestCase):
         adapter._feishu_send_with_retry.assert_awaited_once()
         adapter._close_cardkit_card_before_fallback.assert_awaited_once()
         adapter._run_blocking.assert_awaited_once()
-        adapter._build_update_message_request.assert_called_once_with(
+        adapter._build_patch_message_request.assert_called_once_with(
             message_id="om_123",
             request_body="body",
         )
@@ -878,12 +878,12 @@ class TestFeishuAdapterMessaging(unittest.TestCase):
         adapter = FeishuAdapter(
             PlatformConfig(extra={"streaming_mode": "cardkit"})
         )
-        update_method = object()
+        patch_method = object()
         adapter._client = SimpleNamespace(
             cardkit=SimpleNamespace(),
             im=SimpleNamespace(
                 v1=SimpleNamespace(
-                    message=SimpleNamespace(update=update_method),
+                    message=SimpleNamespace(patch=patch_method),
                 )
             ),
         )
@@ -893,8 +893,8 @@ class TestFeishuAdapterMessaging(unittest.TestCase):
             side_effect=RuntimeError("content rejected")
         )
         adapter._close_cardkit_card_before_fallback = AsyncMock()
-        adapter._build_update_message_body = MagicMock(return_value="body")
-        adapter._build_update_message_request = MagicMock(
+        adapter._build_patch_message_body = MagicMock(return_value="body")
+        adapter._build_patch_message_request = MagicMock(
             return_value=SimpleNamespace(message_id="om_123")
         )
         adapter._run_blocking = AsyncMock(
@@ -1005,6 +1005,57 @@ class TestFeishuAdapterMessaging(unittest.TestCase):
         self.assertTrue(cardkit.supports_single_streaming_message())
         self.assertTrue(cardkit.REQUIRES_EDIT_FINALIZE)
         self.assertTrue(cardkit.supports_unified_stream_status())
+
+    @patch.dict(os.environ, {}, clear=True)
+    def test_streaming_card_edits_same_interactive_message_via_patch(self):
+        from gateway.config import PlatformConfig
+        from plugins.platforms.feishu import adapter as feishu_adapter
+        from plugins.platforms.feishu.adapter import FeishuAdapter
+
+        self.assertTrue(feishu_adapter._load_lark_oapi())
+        adapter = FeishuAdapter(PlatformConfig(extra={"streaming_mode": "card"}))
+        captured = []
+
+        class _MessageAPI:
+            def patch(self, request):
+                captured.append(request)
+                return SimpleNamespace(success=lambda: True)
+
+            def update(self, _request):
+                raise AssertionError("streaming interactive cards must use message.patch")
+
+        adapter._client = SimpleNamespace(
+            im=SimpleNamespace(v1=SimpleNamespace(message=_MessageAPI()))
+        )
+
+        async def _direct(func, *args, **kwargs):
+            return func(*args, **kwargs)
+
+        with patch("plugins.platforms.feishu.adapter.asyncio.to_thread", side_effect=_direct):
+            interim = asyncio.run(
+                adapter.edit_message(
+                    chat_id="oc_chat",
+                    message_id="om_stream",
+                    content="正在回复 ▉",
+                    metadata={"__hermes_streaming": True},
+                )
+            )
+            final = asyncio.run(
+                adapter.edit_message(
+                    chat_id="oc_chat",
+                    message_id="om_stream",
+                    content="最终回复",
+                    finalize=True,
+                    metadata={"__hermes_streaming": True},
+                )
+            )
+
+        self.assertTrue(interim.success)
+        self.assertTrue(final.success)
+        self.assertEqual([request.message_id for request in captured], ["om_stream", "om_stream"])
+        final_payload = json.loads(captured[-1].request_body.content)
+        self.assertFalse(final_payload["config"]["streaming_mode"])
+        self.assertNotIn("▉", final_payload["elements"][0]["content"])
 
     @patch.dict(os.environ, {}, clear=True)
     def test_edit_message_falls_back_to_text_when_post_update_is_rejected(self):

@@ -3605,9 +3605,24 @@ class GatewayTurnMixin:
         ``response["already_sent"]`` and log ``ok``. ``fail_result`` (None = trust the call) logs a
         returned failure as ``(session, error)``; ``fail_exc`` logs an exception as ``(session, exc)``."""
         try:
-            _res = await _sc.adapter.edit_message(
-                chat_id=source.chat_id, message_id=_sc.message_id, content=content, finalize=True,
-            )
+            _edit_kwargs = {
+                "chat_id": source.chat_id,
+                "message_id": _sc.message_id,
+                "content": content,
+                "finalize": True,
+            }
+            _stream_metadata = getattr(_sc, "metadata", None)
+            if _stream_metadata:
+                try:
+                    _params = inspect.signature(_sc.adapter.edit_message).parameters
+                    if "metadata" in _params or any(
+                        _param.kind is inspect.Parameter.VAR_KEYWORD
+                        for _param in _params.values()
+                    ):
+                        _edit_kwargs["metadata"] = _stream_metadata
+                except (TypeError, ValueError):
+                    pass
+            _res = await _sc.adapter.edit_message(**_edit_kwargs)
         except Exception as _edit_err:
             logger.warning(fail_exc, _sk, _edit_err)
             return

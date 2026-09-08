@@ -64,6 +64,7 @@ _LARK_SDK_IMPORTS = (
         "CreateFileRequest", "CreateFileRequestBody", "CreateImageRequest", "CreateImageRequestBody",
         "CreateMessageRequest", "CreateMessageRequestBody", "GetChatRequest", "GetMessageRequest",
         "GetMessageResourceRequest", "P2ImMessageMessageReadV1", "ReplyMessageRequest", "ReplyMessageRequestBody",
+        "PatchMessageRequest", "PatchMessageRequestBody",
         "UpdateMessageRequest", "UpdateMessageRequestBody",
     )),
     ("lark_oapi.core", ("AccessTokenType", "HttpMethod")),
@@ -90,6 +91,8 @@ GetMessageResourceRequest = None  # type: ignore[assignment]
 P2ImMessageMessageReadV1 = None  # type: ignore[assignment]
 ReplyMessageRequest = None  # type: ignore[assignment]
 ReplyMessageRequestBody = None  # type: ignore[assignment]
+PatchMessageRequest = None  # type: ignore[assignment]
+PatchMessageRequestBody = None  # type: ignore[assignment]
 UpdateMessageRequest = None  # type: ignore[assignment]
 UpdateMessageRequestBody = None  # type: ignore[assignment]
 AccessTokenType = None  # type: ignore[assignment]
@@ -1247,6 +1250,8 @@ def _load_lark_oapi() -> bool:
             "P2ImMessageMessageReadV1": P2ImMessageMessageReadV1,
             "ReplyMessageRequest": ReplyMessageRequest,
             "ReplyMessageRequestBody": ReplyMessageRequestBody,
+            "PatchMessageRequest": PatchMessageRequest,
+            "PatchMessageRequestBody": PatchMessageRequestBody,
             "UpdateMessageRequest": UpdateMessageRequest,
             "UpdateMessageRequestBody": UpdateMessageRequestBody,
             "AccessTokenType": AccessTokenType,
@@ -2603,16 +2608,15 @@ class FeishuAdapter(BasePlatformAdapter):
                                         metadata,
                                     )
                                 )
-                                fallback_body = self._build_update_message_body(
-                                    msg_type="interactive",
+                                fallback_body = self._build_patch_message_body(
                                     content=fallback_payload,
                                 )
-                                fallback_request = self._build_update_message_request(
+                                fallback_request = self._build_patch_message_request(
                                     message_id=im_message_id,
                                     request_body=fallback_body,
                                 )
                                 fallback_response = await self._run_blocking(
-                                    self._client.im.v1.message.update,
+                                    self._client.im.v1.message.patch,
                                     fallback_request,
                                 )
                                 fallback_result = self._finalize_send_result(
@@ -2815,16 +2819,13 @@ class FeishuAdapter(BasePlatformAdapter):
                     self._compose_unified_stream_content(content, metadata),
                     finalize=finalize,
                 )
-                body = self._build_update_message_body(
-                    msg_type="interactive",
-                    content=payload,
-                )
-                request = self._build_update_message_request(
+                body = self._build_patch_message_body(content=payload)
+                request = self._build_patch_message_request(
                     message_id=message_id,
                     request_body=body,
                 )
                 response = await self._run_blocking(
-                    self._client.im.v1.message.update,
+                    self._client.im.v1.message.patch,
                     request,
                 )
                 result = self._finalize_send_result(
@@ -5068,6 +5069,14 @@ class FeishuAdapter(BasePlatformAdapter):
     @staticmethod
     def _build_update_message_request(message_id: str, request_body: Any) -> Any:
         return _sdk_build(UpdateMessageRequest, message_id=message_id, request_body=request_body)
+
+    @staticmethod
+    def _build_patch_message_body(*, content: str) -> Any:
+        return _sdk_build(PatchMessageRequestBody, content=content)
+
+    @staticmethod
+    def _build_patch_message_request(message_id: str, request_body: Any) -> Any:
+        return _sdk_build(PatchMessageRequest, message_id=message_id, request_body=request_body)
 
     @staticmethod
     def _build_create_message_body(*, receive_id: str, msg_type: str, content: str, uuid_value: str) -> Any:
