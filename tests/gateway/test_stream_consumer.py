@@ -77,6 +77,38 @@ class TestUnifiedStreamingCard:
         assert adapter.edit_message.await_args.kwargs["finalize"] is True
 
     @pytest.mark.asyncio
+    async def test_cardkit_tool_boundary_keeps_active_card_streaming_until_done(self):
+        """A CardKit single-message stream must not seal at a tool boundary.
+
+        Tool boundaries update the same active card; only the completed turn may
+        replace it with the final CardKit payload that turns streaming_mode off.
+        """
+        adapter = self._adapter()
+        consumer = GatewayStreamConsumer(
+            adapter,
+            "oc_chat",
+            StreamConsumerConfig(edit_interval=0, buffer_threshold=1, cursor=""),
+        )
+
+        task = asyncio.create_task(consumer.run())
+        consumer.on_delta("第一段")
+        await asyncio.sleep(0.05)
+        consumer.on_segment_break()
+        await asyncio.sleep(0.05)
+        consumer.on_delta("第二段")
+        await asyncio.sleep(0.05)
+        consumer.finish("第一段第二段")
+        await task
+
+        finalize_flags = [
+            call.kwargs["finalize"]
+            for call in adapter.edit_message.await_args_list
+        ]
+        assert len(finalize_flags) >= 2
+        assert all(flag is False for flag in finalize_flags[:-1])
+        assert finalize_flags[-1] is True
+
+    @pytest.mark.asyncio
     async def test_moa_lifecycle_updates_and_finalizes_one_card(self):
         adapter = self._adapter()
         consumer = GatewayStreamConsumer(

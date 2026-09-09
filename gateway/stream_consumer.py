@@ -1173,13 +1173,17 @@ class GatewayStreamConsumer(StreamTransportMixin, StreamFallbackMixin, StreamThi
         # unlike an EDIT, which REQUIRES_EDIT_FINALIZE adapters still need a pass for.
         tick.draft_final_fresh_send = (tick.got_done and self._use_draft_streaming
                                        and self._message_id is None)
-        # Segment break finalizes so platforms needing explicit closure (DingTalk AI
-        # Cards) don't leave the segment stuck loading; it closes a preamble, not the
-        # answer.
+        # Single-message transports (CardKit/interactive cards) keep the same
+        # editable surface across tool boundaries. Sealing here turns a CardKit
+        # card into its final shape and closes its streaming window before the
+        # next tool-status update. Segment closure remains necessary only for
+        # multi-message transports such as DingTalk AI cards.
+        finalize = tick.got_done or (
+            tick.got_segment_break and not self._single_streaming_message
+        )
         tick.update_was_fresh_send = self._message_id is None
         tick.update_visible = await self._send_or_edit(
-            display_text, finalize=tick.got_done or tick.got_segment_break,
-            is_turn_final=tick.got_done)
+            display_text, finalize=finalize, is_turn_final=tick.got_done)
         self._last_edit_time = time.monotonic()
         # Lines stay in _tool_progress_lines for the next compose.
         self._tool_progress_active = False
