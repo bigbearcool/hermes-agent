@@ -2135,8 +2135,26 @@ class FeishuAdapter(BasePlatformAdapter):
         card_id: str,
         content: str,
     ) -> None:
-        """Re-open Feishu's expired 10-minute stream and retry once."""
+        """Re-open Feishu's expired 10-minute stream and retry once.
+
+        A 5s flush timeout is ambiguous: the server may have consumed the
+        sequence even though the response never came back.  Before the first
+        retry, advance the local sequence so the resend does not replay a
+        sequence the server already accepted (which surfaces later as 300317
+        "sequence number compare failed" on every following mutation).
+        """
         try:
+            await self._stream_cardkit_content(card_id, content)
+            return
+        except asyncio.TimeoutError:
+            self._commit_cardkit_sequence(
+                card_id, self._next_cardkit_sequence(card_id)
+            )
+            logger.warning(
+                "[Feishu] CardKit update timed out; advancing local sequence for card %s "
+                "to cover a possibly-consumed server sequence",
+                card_id,
+            )
             await self._stream_cardkit_content(card_id, content)
         except Exception as exc:
             if not self._is_cardkit_streaming_closed_error(exc):
@@ -2226,6 +2244,38 @@ class FeishuAdapter(BasePlatformAdapter):
             )
         self._commit_cardkit_sequence(card_id, sequence)
 
+    @staticmethod
+    def _is_cardkit_sequence_rejected_error(exc: BaseException) -> bool:
+        return bool(re.search(r"\b300317\b", str(exc or "")))
+
+    async def _update_cardkit_card_with_seq_recovery(
+        self,
+        card_id: str,
+        card: Dict[str, Any],
+    ) -> None:
+        """Update the card; on 300317, resync the local sequence and retry once.
+
+        300317 means the server's sequence is ahead of ours (typically after an
+        earlier timeout whose request still landed).  Advancing past the
+        conflicting value and retrying once restores the card state instead of
+        leaving it stuck in streaming mode forever.
+        """
+        try:
+            await self._update_cardkit_card(card_id, card)
+            return
+        except Exception as exc:
+            if not self._is_cardkit_sequence_rejected_error(exc):
+                raise
+            logger.warning(
+                "[Feishu] CardKit sequence rejected (300317) for card %s; "
+                "advancing local sequence and retrying once",
+                card_id,
+            )
+            self._commit_cardkit_sequence(
+                card_id, self._next_cardkit_sequence(card_id) + 1
+            )
+            await self._update_cardkit_card(card_id, card)
+
     async def _close_cardkit_card_before_fallback(
         self,
         card_id: Optional[str],
@@ -2242,7 +2292,7 @@ class FeishuAdapter(BasePlatformAdapter):
                 # streaming sequence window; a following full-card update
                 # then races that boundary and Feishu rejects it with 300317
                 # ("sequence number compare failed").
-                await self._update_cardkit_card(
+                await self._update_cardkit_card_with_seq_recovery(
                     card_id,
                     self._build_cardkit_terminal_notice(content),
                 )
