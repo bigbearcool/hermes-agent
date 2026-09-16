@@ -2256,25 +2256,32 @@ class FeishuAdapter(BasePlatformAdapter):
         """Update the card; on 300317, resync the local sequence and retry once.
 
         300317 means the server's sequence is ahead of ours (typically after an
-        earlier timeout whose request still landed).  Advancing past the
-        conflicting value and retrying once restores the card state instead of
-        leaving it stuck in streaming mode forever.
+        earlier timeout or internal error whose request still landed).  A
+        sequence rejection is NOT consumed by the server, so the accepted
+        value is exactly one past our last committed sequence: advance by ONE
+        and retry.  (Skipping a number reproduces 300317 forever and leaves
+        the card stuck in streaming mode.)
         """
-        try:
-            await self._update_cardkit_card(card_id, card)
-            return
-        except Exception as exc:
-            if not self._is_cardkit_sequence_rejected_error(exc):
-                raise
-            logger.warning(
-                "[Feishu] CardKit sequence rejected (300317) for card %s; "
-                "advancing local sequence and retrying once",
-                card_id,
-            )
-            self._commit_cardkit_sequence(
-                card_id, self._next_cardkit_sequence(card_id) + 1
-            )
-            await self._update_cardkit_card(card_id, card)
+        for attempt in range(5):
+            try:
+                await self._update_cardkit_card(card_id, card)
+                return
+            except Exception as exc:
+                if not self._is_cardkit_sequence_rejected_error(exc):
+                    raise
+                logger.warning(
+                    "[Feishu] CardKit sequence rejected (300317) for card %s "
+                    "(recovery attempt %d); advancing local sequence by one "
+                    "and retrying",
+                    card_id,
+                    attempt + 1,
+                )
+                self._commit_cardkit_sequence(
+                    card_id, self._next_cardkit_sequence(card_id)
+                )
+        raise RuntimeError(
+            f"CardKit sequence recovery exhausted for card {card_id}"
+        )
 
     async def _close_cardkit_card_before_fallback(
         self,
