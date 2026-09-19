@@ -706,6 +706,7 @@ class TestPreflightCompression:
     def test_pre_api_compression_waits_for_visible_stream(self, agent):
         """A visible streaming card must not pause for proactive compaction."""
         agent.compression_enabled = True
+        agent.context_compressor.note_usage_less_response()
         agent.context_compressor.context_length = 200_000
         agent.context_compressor.threshold_tokens = 130_000
         agent.compression_defer_callback = lambda: True
@@ -720,9 +721,9 @@ class TestPreflightCompression:
 
         with (
             patch("agent.turn_context.estimate_request_tokens_rough", return_value=10_000),
-            patch("agent.conversation_loop.estimate_request_tokens_rough", return_value=144_669),
+            patch("agent.model_metadata.estimate_request_tokens_rough", return_value=144_669),
             patch(
-                "agent.conversation_loop.estimate_messages_tokens_rough",
+                "agent.model_metadata.estimate_messages_tokens_rough",
                 return_value=144_669,
             ),
             patch.object(agent, "_compress_context") as mock_compress,

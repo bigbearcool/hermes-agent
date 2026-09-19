@@ -16,6 +16,7 @@ from unittest.mock import MagicMock, mock_open, patch
 import pytest
 
 from tools.computer_use import cua_backend
+from tools.computer_use import cua_backend_daemon
 from tools.computer_use import cua_backend_driver
 
 
@@ -227,27 +228,51 @@ class TestMcpArgsOverlayFlag:
 
 
 class TestEmbeddedDaemonOverlayFlag:
-    def test_serve_process_disables_overlay_when_policy_requires_it(self):
+    def test_serve_args_disable_overlay_when_policy_requires_it(self):
         daemon = cua_backend._EmbeddedCuaDaemon("/usr/bin/cua-driver", "unrestricted")
+        with patch.object(cua_backend, "_cua_no_overlay", return_value=True), \
+             patch.object(cua_backend_driver, "_cua_driver_supports_no_overlay", return_value=True):
+            command = daemon._serve_args()
+
+        assert command[0] == "serve"
+        assert "--no-overlay" in command
+
+    @pytest.mark.macos_only
+    def test_serve_process_disables_overlay_when_policy_requires_it(self, tmp_path):
+        app = tmp_path / "CuaDriver.app"
+        driver = app / "Contents" / "MacOS" / "cua-driver"
+        driver.parent.mkdir(parents=True)
+        driver.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+        driver.chmod(0o755)
+        daemon = cua_backend._EmbeddedCuaDaemon(str(driver), "unrestricted")
         process = MagicMock()
-        process.poll.return_value = None
+        # LaunchServices' launcher exits once the app accepts the request.
+        process.poll.return_value = 0
+        signature = MagicMock(
+            returncode=0,
+            stderr="Identifier=com.trycua.driver\nTeamIdentifier=YCK386LBJ7\n",
+        )
         status = MagicMock(returncode=0)
 
         with patch.object(
             cua_backend_driver,
             "_resolve_mcp_invocation",
-            return_value=("/usr/bin/cua-driver", ["mcp"]),
+            return_value=(str(driver), ["mcp"]),
         ), patch.object(
             cua_backend, "_cua_no_overlay", return_value=True,
         ), patch.object(
             cua_backend_driver, "_cua_driver_supports_no_overlay", return_value=True,
         ), patch.object(
+            cua_backend_daemon.shutil, "which", return_value="/usr/bin/codesign",
+        ), patch.object(
             cua_backend.subprocess, "Popen", return_value=process,
         ) as popen, patch.object(
-            cua_backend.subprocess, "run", return_value=status,
-        ), patch.object(cua_backend.threading, "Thread"):
+            cua_backend.subprocess, "run", side_effect=[signature, status],
+        ) as run, patch.object(cua_backend.threading, "Thread"):
             daemon.start()
 
         command = popen.call_args.args[0]
-        assert command[:2] == ["/usr/bin/cua-driver", "serve"]
-        assert "--no-overlay" in command
+        assert command[:7] == ["/usr/bin/open", "-n", "-g", "-a", str(app), "--args", "serve"]
+        assert "--no-overlay" in command[7:]
+        assert run.call_args_list[0].args[0] == ["/usr/bin/codesign", "-dv", str(app)]
+        assert run.call_args_list[1].args[0] == [str(driver), "status", "--socket", daemon.socket_path]

@@ -1,7 +1,7 @@
 """Explicit RFC 8628 MCP login, sharing SDK discovery, client auth and token storage.
 
 The SDK still owns runtime requests and refresh. Device authorization is only
-started by `hermes mcp login/reauth`, never a background reconnect.
+started by explicit MCP setup/login/reauth, never a background reconnect.
 """
 from __future__ import annotations
 
@@ -9,6 +9,7 @@ import asyncio
 import math
 import sys
 import time
+from urllib.parse import urlparse
 
 from mcp.shared.auth import OAuthMetadata
 from pydantic import AnyHttpUrl
@@ -22,7 +23,16 @@ class DeviceOAuthMetadata(OAuthMetadata):
     device_authorization_endpoint: AnyHttpUrl
 
 
-async def _discover(client, provider):
+def _device_url(value, field, *, require_https=False):
+    url = str(AnyHttpUrl(value))
+    parsed = urlparse(url)
+    if require_https and not (parsed.scheme == "https" or
+            parsed.hostname in {"127.0.0.1", "localhost", "::1"}):
+        raise RuntimeError(f"Device OAuth has invalid {field}")
+    return url
+
+
+async def _discover(client, provider, *, require_https=False):
     from mcp.client.auth.exceptions import OAuthFlowError
     from mcp.client.auth.utils import (
         build_protected_resource_metadata_discovery_urls,
@@ -46,7 +56,7 @@ async def _discover(client, provider):
     failures = []
     for auth_server_url in servers:
         try:
-            metadata = await _device_metadata(client, context.server_url, auth_server_url)
+            metadata = await _device_metadata(client, context.server_url, auth_server_url, require_https=require_https)
         except (RuntimeError, OAuthFlowError, ValueError) as exc:
             failures.append((auth_server_url, exc))
             continue
@@ -59,7 +69,7 @@ async def _discover(client, provider):
                        + "; ".join(f"{url}: {exc}" for url, exc in failures))
 
 
-async def _device_metadata(client, server_url, auth_server_url):
+async def _device_metadata(client, server_url, auth_server_url, *, require_https=False):
     """Issuer-bound device metadata of one authorization server; raises when it is unusable."""
     from mcp.client.auth.utils import build_oauth_authorization_server_metadata_discovery_urls, validate_metadata_issuer
 
@@ -73,6 +83,10 @@ async def _device_metadata(client, server_url, auth_server_url):
         metadata = DeviceOAuthMetadata.model_validate(data)
         if auth_server_url:
             validate_metadata_issuer(metadata, auth_server_url)
+        for field in ("registration_endpoint", "device_authorization_endpoint", "token_endpoint"):
+            endpoint = getattr(metadata, field, None)
+            if endpoint is not None:
+                _device_url(endpoint, field, require_https=require_https)
         grants = metadata.grant_types_supported
         if grants is not None and DEVICE_GRANT not in grants:
             raise RuntimeError("Server does not advertise the device_code grant")
@@ -99,12 +113,31 @@ async def _register(client, provider, cfg):
 
     context = provider.context
     metadata = context.client_metadata.model_dump(mode="json", exclude_none=True)
-    metadata.update(grant_types=[DEVICE_GRANT, "refresh_token"], response_types=[])
+    metadata.update(grant_types=[DEVICE_GRANT, "refresh_token"])
+    # A pure device client has no browser callback. Some device-only registries
+    # reject redirect/response fields rather than ignoring them.
+    metadata.pop("redirect_uris", None)
+    metadata.pop("response_types", None)
     if cfg.get("client_id"):
         data = {**metadata, "client_id": cfg["client_id"]}
         if cfg.get("client_secret"):
             data["client_secret"] = cfg["client_secret"]
     else:
+        # Read without get_client_info's on-disk auth-method migration: a denied
+        # grant must leave the previous registration and token files untouched.
+        storage = context.storage
+        cached = storage._load_model(storage._client_info_path(), "OAuthClientInformationFull", "client info")
+        if (cached is not None and DEVICE_GRANT in (cached.grant_types or [])
+                and str(getattr(cached, "issuer", "") or "").rstrip("/")
+                == str(context.oauth_metadata.issuer).rstrip("/")):
+            context.client_info = cached
+            provider._coerce_client_secret_post()
+            try:
+                check_registration_usable(context.client_info)
+            except OAuthRegistrationError:
+                pass  # An unusable cached client needs fresh registration.
+            else:
+                return
         endpoint = context.oauth_metadata.registration_endpoint
         if not endpoint:
             raise RuntimeError("Server has no registration endpoint; configure oauth.client_id (and client_secret if required)")
@@ -126,7 +159,7 @@ def _positive_seconds(value, label):
     return value
 
 
-async def _authorize(client, provider, cfg):
+async def _authorize(client, provider, cfg, display=None, *, require_https=False):
     from tools.mcp_tool import sdk_httpx
 
     context = provider.context
@@ -140,12 +173,20 @@ async def _authorize(client, provider, cfg):
     for key in ("device_code", "user_code", "verification_uri"):
         if not isinstance(authorization.get(key), str) or not authorization[key]:
             raise RuntimeError(f"Device authorization is missing {key}")
-    verification = AnyHttpUrl(authorization["verification_uri"])
+    verification = _device_url(authorization["verification_uri"], "verification_uri", require_https=require_https)
+    verification_complete = authorization.get("verification_uri_complete")
+    if verification_complete:
+        verification_complete = _device_url(verification_complete, "verification_uri_complete", require_https=require_https)
     interval = _positive_seconds(authorization.get("interval", 5), "interval")
-    deadline = time.monotonic() + min(_positive_seconds(authorization["expires_in"], "expires_in"),
-                                     _positive_seconds(cfg.get("timeout", 300), "timeout"))
-    print(f"\n  MCP OAuth: open {verification} on any device.\n  Code: {authorization['user_code']}\n"
-          "  Waiting for approval...\n", file=sys.stderr, flush=True)
+    expires_in = _positive_seconds(authorization["expires_in"], "expires_in")
+    deadline = time.monotonic() + min(expires_in,
+                                    _positive_seconds(cfg.get("timeout", 300), "timeout"))
+    if display is None:
+        print(f"\n  MCP OAuth: open {verification_complete or verification} on any device.\n"
+              f"  Code: {authorization['user_code']}\n  Waiting for approval...\n", file=sys.stderr, flush=True)
+    else:
+        display(dict(verification_uri=verification, verification_uri_complete=verification_complete,
+                     user_code=authorization["user_code"], expires_in=expires_in, interval=interval))
     token_data = {"client_id": context.client_info.client_id, "device_code": authorization["device_code"],
                   "grant_type": DEVICE_GRANT, "resource": resource}
     token_data, headers = context.prepare_token_auth(token_data, {})
@@ -184,14 +225,16 @@ async def _authorize(client, provider, cfg):
         raise RuntimeError(f"Device authorization failed: {safe_error}")
 
 
-async def login_device(name, server_url, oauth_config):
+async def login_device(name, server_url, oauth_config, *, display=None, hermes_home=None, require_https=False):
     """Authorize then commit state in the active profile; failed grants preserve old state."""
-    from tools.mcp_oauth import _build_client_metadata
+    from tools.mcp_oauth import HermesTokenStorage, _build_client_metadata
     from tools.mcp_oauth_manager import HermesMCPOAuthProvider, get_manager
     from tools.mcp_oauth_provider import prepare_oauth_config
     from tools.mcp_tool import sdk_httpx
 
     cfg, storage = prepare_oauth_config(name, server_url, oauth_config)
+    if hermes_home is not None:
+        storage = HermesTokenStorage(name, hermes_home=hermes_home)
     # Device flow never binds a callback socket or uses the hosted browser CIMD.
     cfg["_resolved_port"] = cfg.get("redirect_port", 8420)
     provider = HermesMCPOAuthProvider(server_url=server_url, server_name=name, storage=storage,
@@ -200,9 +243,9 @@ async def login_device(name, server_url, oauth_config):
     httpx = sdk_httpx()
     try:
         async with httpx.AsyncClient(timeout=10, follow_redirects=False) as client:
-            await _discover(client, provider)
+            await _discover(client, provider, require_https=require_https)
             await _register(client, provider, cfg)
-            tokens = await _authorize(client, provider, cfg)
+            tokens = await _authorize(client, provider, cfg, display=display, require_https=require_https)
     except (ValueError, TypeError, KeyError):
         raise RuntimeError("Device OAuth response has invalid fields") from None
     except httpx.HTTPError:
@@ -212,8 +255,10 @@ async def login_device(name, server_url, oauth_config):
     try:
         await storage.set_client_info(provider.context.client_info)
         storage.save_oauth_metadata(provider.context.oauth_metadata)
+        storage.bind_issuer(str(provider.context.oauth_metadata.issuer))
         await storage.set_tokens(tokens)
     except OSError:
         storage.restore(previous)
         raise
-    get_manager().evict(name)
+    get_manager().evict(name, hermes_home=hermes_home)
+    return tokens

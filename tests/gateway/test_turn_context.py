@@ -10,7 +10,7 @@ itself (that's covered by test_run_progress_topics.py et al.).
 
 import asyncio
 import queue as queue_mod
-from types import SimpleNamespace
+from types import MethodType, SimpleNamespace
 from unittest.mock import MagicMock
 
 import pytest
@@ -24,7 +24,7 @@ def _make_runner(ctx):
     from gateway.run_turn_runner import TurnRunner
 
     class _StubGatewayRunner:
-        def _adapter_for_source(self, source):
+        def _delivery_adapter_for(self, source):
             return None
 
     return TurnRunner(_StubGatewayRunner(), ctx)
@@ -71,6 +71,7 @@ class TestTurnRunner:
 
     def test_normal_response_preserves_compression_exhausted(self):
         """A non-empty exhaustion response must still reach auto-reset consumers."""
+        from gateway.run_turn import GatewayTurnMixin
 
         class _ExhaustedAgent:
             def __init__(self, **kwargs):
@@ -95,6 +96,7 @@ class TestTurnRunner:
         gateway_runner = MagicMock()
         gateway_runner.config = SimpleNamespace(streaming=None)
         gateway_runner._provider_routing = {}
+        gateway_runner._session_model_overrides = {}
         gateway_runner._agent_cache_lock = None
         gateway_runner._agent_cache = {}
         gateway_runner._session_db = None
@@ -104,6 +106,7 @@ class TestTurnRunner:
         gateway_runner.session_store._entries = {}
         gateway_runner._get_system_prompt_for_channel.return_value = None
         gateway_runner._resolve_session_agent_runtime.return_value = ("test-model", {})
+        gateway_runner._apply_task_model_route = MethodType(GatewayTurnMixin._apply_task_model_route, gateway_runner)
         gateway_runner._resolve_session_reasoning_config.return_value = None
         gateway_runner._resolve_session_service_tier.return_value = None
         gateway_runner._resolve_turn_agent_config.return_value = {

@@ -121,6 +121,38 @@ def test_gateway_preserves_explicit_session_model_override():
     assert runtime["provider"] == "custom:grok-4.5"
 
 
+def test_gateway_task_route_resolves_runtime_for_its_target_model(tmp_path, monkeypatch):
+    """Task routes must use their own model when selecting the provider endpoint."""
+    home = tmp_path / "hermes"
+    home.mkdir()
+    (home / "config.yaml").write_text(
+        "model:\n  default: mimo-v2.5-free\n  provider: opencode\n"
+        "  base_url: https://opencode.ai/zen/v1\n"
+    )
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    monkeypatch.setenv("OPENCODE_GO_API_KEY", "sk-test-go")
+    runner = object.__new__(gateway_run.GatewayRunner)
+    runner._session_model_overrides = {}
+    policy = {
+        **CONFIG["task_model_routing"],
+        "routes": {"quick": {"provider": "opencode-go", "model": "minimax-m2.5"}},
+    }
+
+    model, runtime = runner._apply_task_model_route(
+        "把这段通知压缩成三条要点：本周门店盘点安排如下。",
+        "mimo-v2.5-free",
+        {"provider": "opencode", "api_key": "test-key"},
+        user_config={"task_model_routing": policy},
+        platform="feishu",
+        session_key="session-1",
+    )
+
+    assert model == "minimax-m2.5"
+    assert runtime["provider"] == "opencode-go"
+    assert runtime["api_mode"] == "anthropic_messages"
+    assert runtime["base_url"] == "https://opencode.ai/zen/go"
+
+
 def test_router_accepts_json_scalar_values_written_by_config_cli():
     cli_config = {
         "task_model_routing": {

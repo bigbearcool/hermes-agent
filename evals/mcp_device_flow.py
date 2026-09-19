@@ -114,13 +114,15 @@ def oauth_fixture(mode="success"):
         worker.join()
 
 
-def run_cli(repo, mode):
+def run_cli(repo, mode, *, entrypoint="login"):
     with tempfile.TemporaryDirectory(prefix="hermes-device-wire-") as directory, oauth_fixture(mode) as (base, wire):
         home = Path(directory)
         oauth = {"flow": "device", "cimd": False, "scope": "fixture.read", "timeout": 15}
         if mode == "preregistered":
             oauth.update(client_id="fixture-client", client_secret="fixture-client-secret")
         config = {"mcp_servers": {"fixture": {"url": base + "/mcp", "auth": "oauth", "oauth": oauth}}}
+        if entrypoint == "add":
+            config["mcp_servers"] = {}
         (home / "config.yaml").write_text(json.dumps(config))
         previous = {}
         if mode == "persistence":
@@ -135,6 +137,8 @@ def run_cli(repo, mode):
                if not key.startswith("HERMES_") and not any(part in key for part in ("API_KEY", "TOKEN", "SECRET"))}
         env.update(HOME=str(home), HERMES_HOME=str(home), PYTHONPATH=str(repo), PYTHONDONTWRITEBYTECODE="1")
         command = ["reauth", "fixture"] if mode == "preregistered" else ["login", "fixture", "--flow", "device"]
+        if entrypoint == "add":
+            command = ["add", "fixture", "--url", base + "/mcp", "--auth", "device", "--scope", "fixture.read"]
         argv = [sys.executable, "-m", "hermes_cli.main", "mcp", *command]
         if mode == "persistence":
             # Inject a filesystem write error after real registration/metadata writes.
@@ -149,8 +153,9 @@ mcp_oauth._write_json = fail_token
 from hermes_cli.main import main
 main()
 ''', "mcp", *command]
-        result = subprocess.run(argv,
-                                cwd=repo, env=env, stdin=subprocess.DEVNULL, capture_output=True, text=True, timeout=40)
+        stdin_options = {"input": "\n"} if entrypoint == "add" else {"stdin": subprocess.DEVNULL}
+        result = subprocess.run(argv, cwd=repo, env=env, **stdin_options,
+                                capture_output=True, text=True, timeout=40)
         token_path = home / "mcp-tokens" / "fixture.json"
         refresh_output = None
         if token_path.exists() and not previous:

@@ -32,6 +32,8 @@ def _wire(user_config):
         _status_adapter=None,
         session_key="",
         user_config=user_config,
+        source=types.SimpleNamespace(platform="telegram"),
+        mute_notification_reply=False,
         _thinking_enabled=False,
         agent_holder=[None],
         tools_holder=[None],
@@ -50,6 +52,7 @@ def _wire(user_config):
         _clarify_callback_sync=lambda *a, **k: None,
         _notice_callback_sync=lambda *a, **k: None,
         _attach_session_title_callback=lambda agent, ctx: None,
+        _stream_consumer=lambda: None,
     )
     TurnRunner._wire_turn_agent_callbacks(holder, agent, {}, None, None, None, False)
     return agent

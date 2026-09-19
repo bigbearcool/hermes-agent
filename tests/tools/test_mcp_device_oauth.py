@@ -3,15 +3,18 @@
 from __future__ import annotations
 
 import json
+from urllib.parse import parse_qs
 
 import pytest
 
 
 @pytest.mark.asyncio
-async def test_device_flow_discovers_registers_polls_and_persists(tmp_path, monkeypatch):
+@pytest.mark.parametrize("entrypoint", ["legacy_https", "legacy_http", "shared_http"])
+async def test_device_flow_discovers_registers_polls_and_persists(tmp_path, monkeypatch, entrypoint):
     from tools import mcp_device_oauth
     from tools.mcp_tool import sdk_httpx
 
+    origin = "https://tenant.example.com" if entrypoint == "legacy_https" else "http://tenant.example.com"
     real_httpx = sdk_httpx()
     assert real_httpx is not None
     requests = []
@@ -33,26 +36,25 @@ async def test_device_flow_discovers_registers_polls_and_persists(tmp_path, monk
         async def __aexit__(self, *_args):
             return False
 
-        async def send(self, request):
-            url = str(request.url)
+        async def get(self, url):
             requests.append(("GET", url, None))
             if "oauth-protected-resource" in url:
                 return response(
                     200,
                     {
-                        "resource": "https://tenant.example.com/mcp",
-                        "authorization_servers": ["https://tenant.example.com"],
+                        "resource": f"{origin}/mcp",
+                        "authorization_servers": [f"{origin}"],
                     },
                     url,
                 )
             return response(
                 200,
                 {
-                    "issuer": "https://tenant.example.com",
-                    "authorization_endpoint": "https://tenant.example.com/oauth/authorize",
-                    "device_authorization_endpoint": "https://tenant.example.com/oauth/device/authorization",
-                    "token_endpoint": "https://tenant.example.com/oauth/token",
-                    "registration_endpoint": "https://tenant.example.com/oauth/register",
+                    "issuer": f"{origin}",
+                    "authorization_endpoint": f"{origin}/oauth/authorize",
+                    "device_authorization_endpoint": f"{origin}/oauth/device/authorization",
+                    "token_endpoint": f"{origin}/oauth/token",
+                    "registration_endpoint": f"{origin}/oauth/register",
                     "grant_types_supported": [
                         mcp_device_oauth.DEVICE_GRANT_TYPE,
                         "refresh_token",
@@ -62,7 +64,11 @@ async def test_device_flow_discovers_registers_polls_and_persists(tmp_path, monk
                 url,
             )
 
-        async def post(self, url, *, json=None, data=None):
+        async def send(self, request):
+            data = {key: values[0] for key, values in parse_qs(request.content.decode()).items()}
+            return await self.post(str(request.url), data=data)
+
+        async def post(self, url, *, json=None, data=None, headers=None):
             requests.append(("POST", url, json if json is not None else data))
             if url.endswith("/oauth/register"):
                 return response(
@@ -88,8 +94,8 @@ async def test_device_flow_discovers_registers_polls_and_persists(tmp_path, monk
                     {
                         "device_code": "secret-device-code",
                         "user_code": "XS-ABCD-2345",
-                        "verification_uri": "https://tenant.example.com/settings/personal-agent",
-                        "verification_uri_complete": "https://tenant.example.com/settings/personal-agent?code=XS-ABCD-2345",
+                        "verification_uri": f"{origin}/settings/personal-agent",
+                        "verification_uri_complete": f"{origin}/settings/personal-agent?code=XS-ABCD-2345",
                         "expires_in": 600,
                         "interval": 1,
                     },
@@ -112,6 +118,9 @@ async def test_device_flow_discovers_registers_polls_and_persists(tmp_path, monk
 
     class FakeHttpx:
         Timeout = real_httpx.Timeout
+        Request = real_httpx.Request
+        HTTPError = real_httpx.HTTPError
+        TimeoutException = real_httpx.TimeoutException
         AsyncClient = FakeClient
 
     async def no_sleep(_seconds):
@@ -121,16 +130,28 @@ async def test_device_flow_discovers_registers_polls_and_persists(tmp_path, monk
     monkeypatch.setattr(mcp_device_oauth.asyncio, "sleep", no_sleep)
     displayed = []
 
-    tokens = await mcp_device_oauth.authorize_device(
-        "xiaosheng",
-        "https://tenant.example.com/mcp",
-        scope="agent:list work:read",
-        display=displayed.append,
-        hermes_home=tmp_path,
-    )
+    async def authorize():
+        if entrypoint == "shared_http":
+            from tools.mcp_oauth_device import login_device
+            return await login_device(
+                "xiaosheng", f"{origin}/mcp", {"scope": "agent:list work:read"},
+                display=lambda info: displayed.append(info["user_code"]), hermes_home=tmp_path,
+            )
+        return await mcp_device_oauth.authorize_device(
+            "xiaosheng", f"{origin}/mcp", scope="agent:list work:read",
+            display=lambda info: displayed.append(info.user_code), hermes_home=tmp_path,
+        )
 
+    if entrypoint == "legacy_http":
+        with pytest.raises(mcp_device_oauth.DeviceOAuthError, match="invalid registration_endpoint"):
+            await authorize()
+        assert not (tmp_path / "mcp-tokens" / "xiaosheng.json").exists()
+        assert not any(method == "POST" for method, _, _ in requests)
+        return
+
+    tokens = await authorize()
     assert tokens.access_token == "access-secret"
-    assert displayed[0].user_code == "XS-ABCD-2345"
+    assert displayed == ["XS-ABCD-2345"]
     registration = next(payload for method, url, payload in requests if url.endswith("/oauth/register"))
     assert registration["grant_types"] == [mcp_device_oauth.DEVICE_GRANT_TYPE, "refresh_token"]
     assert "redirect_uris" not in registration
@@ -139,9 +160,13 @@ async def test_device_flow_discovers_registers_polls_and_persists(tmp_path, monk
         payload for method, url, payload in requests if url.endswith("/oauth/device/authorization")
     )
     assert device_request["client_id"] == "device-client-id"
+    assert device_request["resource"] == f"{origin}/mcp"
     token_file = tmp_path / "mcp-tokens" / "xiaosheng.json"
     client_file = tmp_path / "mcp-tokens" / "xiaosheng.client.json"
     assert json.loads(token_file.read_text())["refresh_token"] == "refresh-secret"
+    assert json.loads(token_file.read_text())["hermes_issuer"] == json.loads(
+        (tmp_path / "mcp-tokens" / "xiaosheng.meta.json").read_text()
+    )["issuer"]
     assert json.loads(client_file.read_text())["client_id"] == "device-client-id"
     assert token_file.stat().st_mode & 0o077 == 0
 
@@ -151,6 +176,9 @@ async def test_device_flow_reuses_matching_registered_client(tmp_path, monkeypat
     from mcp.shared.auth import OAuthClientInformationFull
     from tools import mcp_device_oauth
     from tools.mcp_oauth import HermesTokenStorage
+    from tools.mcp_tool import sdk_httpx
+
+    real_httpx = sdk_httpx()
 
     storage = HermesTokenStorage("xiaosheng", hermes_home=tmp_path)
     await storage.set_client_info(
@@ -175,10 +203,7 @@ async def test_device_flow_reuses_matching_registered_client(tmp_path, monkeypat
         async def __aexit__(self, *_args):
             return False
 
-        async def send(self, request):
-            import httpx
-
-            url = str(request.url)
+        async def get(self, url):
             if "oauth-protected-resource" in url:
                 payload = {
                     "resource": "https://tenant.example.com/mcp",
@@ -194,11 +219,13 @@ async def test_device_flow_reuses_matching_registered_client(tmp_path, monkeypat
                     "grant_types_supported": [mcp_device_oauth.DEVICE_GRANT_TYPE, "refresh_token"],
                     "response_types_supported": ["code"],
                 }
-            return httpx.Response(200, json=payload, request=httpx.Request("GET", url))
+            return real_httpx.Response(200, json=payload, request=real_httpx.Request("GET", url))
 
-        async def post(self, url, *, json=None, data=None):
-            import httpx
+        async def send(self, request):
+            data = {key: values[0] for key, values in parse_qs(request.content.decode()).items()}
+            return await self.post(str(request.url), data=data)
 
+        async def post(self, url, *, json=None, data=None, headers=None):
             if url.endswith("/oauth/register"):
                 registration_calls.append(json)
                 raise AssertionError("matching client registration must be reused")
@@ -211,19 +238,20 @@ async def test_device_flow_reuses_matching_registered_client(tmp_path, monkeypat
                     "expires_in": 60,
                     "interval": 1,
                 }
-                return httpx.Response(201, json=payload, request=httpx.Request("POST", url))
+                return real_httpx.Response(201, json=payload, request=real_httpx.Request("POST", url))
             payload = {
                 "access_token": "access-secret",
                 "refresh_token": "refresh-secret",
                 "token_type": "Bearer",
                 "expires_in": 3600,
             }
-            return httpx.Response(200, json=payload, request=httpx.Request("POST", url))
+            return real_httpx.Response(200, json=payload, request=real_httpx.Request("POST", url))
 
     class FakeHttpx:
-        import httpx as _httpx
-
-        Timeout = _httpx.Timeout
+        Timeout = real_httpx.Timeout
+        Request = real_httpx.Request
+        HTTPError = real_httpx.HTTPError
+        TimeoutException = real_httpx.TimeoutException
         AsyncClient = ReuseClient
 
     async def no_sleep(_seconds):

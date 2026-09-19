@@ -9,13 +9,16 @@ import { saveHermesConfig } from '@/hermes'
 
 import { $voiceStopPhrase, applyVoiceStopPhraseFromConfig } from './voice-prefs'
 
+// Node 26's test fallback owns the method; jsdom's Storage uses its prototype.
+const storageWriteTarget = Object.hasOwn(localStorage, 'setItem') ? localStorage : Storage.prototype
+
 it('keeps the desktop toggle local across config refreshes', async () => {
   for (const fails of [false, true]) {
     for (const enabled of [false, true]) {
       localStorage.clear()
       vi.resetModules()
       const prefs = await import('./voice-prefs')
-      const write = vi.spyOn(localStorage, 'setItem')
+      const write = vi.spyOn(storageWriteTarget, 'setItem')
 
       if (fails) {
         write.mockImplementation(() => {
@@ -44,7 +47,7 @@ it('migrates the legacy preference once, not on every refresh', async () => {
       localStorage.clear()
       vi.resetModules()
       const prefs = await import('./voice-prefs')
-      const write = vi.spyOn(localStorage, 'setItem')
+      const write = vi.spyOn(storageWriteTarget, 'setItem')
 
       if (fails) {
         write.mockImplementation(() => {
