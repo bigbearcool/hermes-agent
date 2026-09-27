@@ -26,7 +26,7 @@ interface Blueprint {
 
 const INDEX_URL = "/docs/api/automation-blueprints-index.json";
 
-function CopyButton({ text }: { text: string }): JSX.Element {
+function CopyButton({ text }: { text: string }): React.JSX.Element {
   const [copied, setCopied] = useState(false);
   return (
     <button
@@ -45,7 +45,7 @@ function CopyButton({ text }: { text: string }): JSX.Element {
   );
 }
 
-function BlueprintCard({ blueprint }: { blueprint: Blueprint }): JSX.Element {
+function BlueprintCard({ blueprint }: { blueprint: Blueprint }): React.JSX.Element {
   return (
     <div className={styles.card}>
       <div className={styles.cardHead}>
@@ -79,7 +79,7 @@ function BlueprintCard({ blueprint }: { blueprint: Blueprint }): JSX.Element {
   );
 }
 
-export default function AutomationBlueprintsCatalog(): JSX.Element {
+export default function AutomationBlueprintsCatalog(): React.JSX.Element {
   const [blueprints, setBlueprints] = useState<Blueprint[] | null>(null);
   const [error, setError] = useState<string | null>(null);
 

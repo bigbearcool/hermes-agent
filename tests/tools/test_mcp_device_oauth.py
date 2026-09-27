@@ -172,7 +172,8 @@ async def test_device_flow_discovers_registers_polls_and_persists(tmp_path, monk
 
 
 @pytest.mark.asyncio
-async def test_device_flow_reuses_matching_registered_client(tmp_path, monkeypatch):
+@pytest.mark.parametrize("issuer_path", ["", "/mcp-issuer"])
+async def test_device_flow_reuses_matching_registered_client(tmp_path, monkeypatch, issuer_path):
     from mcp.shared.auth import OAuthClientInformationFull
     from tools import mcp_device_oauth
     from tools.mcp_oauth import HermesTokenStorage
@@ -180,6 +181,7 @@ async def test_device_flow_reuses_matching_registered_client(tmp_path, monkeypat
 
     real_httpx = sdk_httpx()
 
+    advertised_issuer = "https://tenant.example.com" + issuer_path
     storage = HermesTokenStorage("xiaosheng", hermes_home=tmp_path)
     await storage.set_client_info(
         OAuthClientInformationFull(
@@ -187,7 +189,7 @@ async def test_device_flow_reuses_matching_registered_client(tmp_path, monkeypat
             client_name="Hermes Agent",
             grant_types=[mcp_device_oauth.DEVICE_GRANT_TYPE, "refresh_token"],
             token_endpoint_auth_method="none",
-            issuer="https://tenant.example.com",
+            issuer=advertised_issuer,
         )
     )
 
@@ -207,7 +209,7 @@ async def test_device_flow_reuses_matching_registered_client(tmp_path, monkeypat
             if "oauth-protected-resource" in url:
                 payload = {
                     "resource": "https://tenant.example.com/mcp",
-                    "authorization_servers": ["https://tenant.example.com"],
+                    "authorization_servers": [advertised_issuer],
                 }
             else:
                 payload = {
@@ -268,6 +270,10 @@ async def test_device_flow_reuses_matching_registered_client(tmp_path, monkeypat
 
     assert tokens.access_token == "access-secret"
     assert registration_calls == []
+    stored_tokens = json.loads((tmp_path / "mcp-tokens" / "xiaosheng.json").read_text())
+    stored_client = json.loads((tmp_path / "mcp-tokens" / "xiaosheng.client.json").read_text())
+    assert stored_tokens["hermes_issuer"].rstrip("/") == "https://tenant.example.com"
+    assert stored_client["issuer"].rstrip("/") == advertised_issuer
 
 
 def test_device_cli_parser_accepts_scope_and_device_auth():
