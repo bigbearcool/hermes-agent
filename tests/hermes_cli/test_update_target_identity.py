@@ -29,6 +29,8 @@ def update_tree(tmp_path, monkeypatch):
     monkeypatch.setenv('GIT_ALLOW_PROTOCOL', 'file')
     monkeypatch.delenv('HERMES_UPDATE_HANDOFF_PID', raising=False)
     monkeypatch.delenv('HERMES_UPDATE_REEXEC', raising=False)
+    monkeypatch.setattr(
+        "hermes_cli.update_owning_install.retarget_to_owning_install", lambda *_: None)
     origin = tmp_path / 'origin'
     origin.mkdir()
     git(origin, 'init', '-q', '-b', 'main')

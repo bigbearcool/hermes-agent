@@ -4,6 +4,12 @@ from __future__ import annotations
 
 import pytest
 
+# update_cmd resolves main lazily so production imports stay one-way.  Import
+# the entry module while pytest is collecting this package, before the per-test
+# real-home I/O guard is active; otherwise a checkout installed under
+# ~/.hermes attempts PM payload discovery on the first helper call in a test.
+from hermes_cli import main as _cli_main  # noqa: F401
+
 
 @pytest.fixture
 def all_assignees_spawnable(monkeypatch):
