@@ -1455,6 +1455,8 @@ platform:
       file_too_large: "A fájl mérete ({size_mb} MB) meghaladja a WeCom 20 MB-os korlátját, így nem küldhető el. Próbáld tömöríteni vagy kisebbre venni a fájlt."
       voice_format_downgraded: "A {content_type} hangformátum nem támogatott (a WeCom csak AMR-t fogad); fájlként küldtem el helyette."
       size_downgraded: "{label} mérete ({size_mb} MB) meghaladja a {cap} korlátot; fájlként küldtem el helyette."
+      inbound_unreadable: "[An attachment arrived but could not be read: {detail}. Tell the user the file did not come through and suggest resending it another way.]"
+      inbound_unknown_reason: "unknown reason"
   email:
     image_line: "Kép: {url}"
     standalone_subject: "Hermes Agent"

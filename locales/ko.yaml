@@ -1438,6 +1438,8 @@ platform:
       file_too_large: "파일 크기 {size_mb}MB가 WeCom의 20MB 한도를 넘어 보낼 수 없어요. 파일을 압축하거나 크기를 줄여 보세요."
       voice_format_downgraded: "음성 형식 {content_type}은(는) 지원되지 않아요 (WeCom은 AMR만 허용). 대신 파일로 보냈어요."
       size_downgraded: "{label} 크기 {size_mb}MB가 {cap} 한도를 넘어 대신 파일로 보냈어요."
+      inbound_unreadable: "[An attachment arrived but could not be read: {detail}. Tell the user the file did not come through and suggest resending it another way.]"
+      inbound_unknown_reason: "unknown reason"
   email:
     image_line: "이미지: {url}"
     standalone_subject: "Hermes Agent"

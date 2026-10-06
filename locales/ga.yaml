@@ -1438,6 +1438,8 @@ platform:
       file_too_large: "Sáraíonn méid an chomhaid {size_mb}MB teorainn 20MB WeCom agus ní féidir é a sheoladh. Bain triail as an gcomhad a dhlúthú nó a mhéid a laghdú."
       voice_format_downgraded: "Ní thacaítear leis an bhformáid ghutha {content_type} (ní ghlacann WeCom ach le AMR); seoladh mar chomhad ina ionad."
       size_downgraded: "Sáraíonn méid {label} {size_mb}MB an teorainn {cap}; seoladh mar chomhad ina ionad."
+      inbound_unreadable: "[An attachment arrived but could not be read: {detail}. Tell the user the file did not come through and suggest resending it another way.]"
+      inbound_unknown_reason: "unknown reason"
   email:
     image_line: "Íomhá: {url}"
     standalone_subject: "Hermes Agent"

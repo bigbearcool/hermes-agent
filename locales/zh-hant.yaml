@@ -1438,6 +1438,8 @@ platform:
       file_too_large: "檔案大小 {size_mb}MB 超過 WeCom 的 20MB 上限，無法傳送。請嘗試壓縮檔案或縮小其大小。"
       voice_format_downgraded: "不支援語音格式 {content_type}（WeCom 只接受 AMR）；已改以檔案傳送。"
       size_downgraded: "{label}大小 {size_mb}MB 超過 {cap} 上限；已改以檔案傳送。"
+      inbound_unreadable: "［收到一個附件，但內容未能讀取：{detail}。請告知使用者檔案沒有收到，並建議改用其他方式重送。］"
+      inbound_unknown_reason: "未知原因"
   email:
     image_line: "圖片：{url}"
     standalone_subject: "Hermes Agent"

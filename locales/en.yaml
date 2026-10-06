@@ -1505,6 +1505,8 @@ platform:
       file_too_large: "File size {size_mb}MB exceeds WeCom's 20MB limit and cannot be sent. Try compressing the file or reducing its size."
       voice_format_downgraded: "Voice format {content_type} is not supported (WeCom only accepts AMR); sent as a file instead."
       size_downgraded: "{label} size {size_mb}MB exceeds the {cap} limit; sent as a file instead."
+      inbound_unreadable: "[An attachment arrived but could not be read: {detail}. Tell the user the file did not come through and suggest resending it another way.]"
+      inbound_unknown_reason: "unknown reason"
 
   email:
     image_line: "Image: {url}"

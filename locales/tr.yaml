@@ -1438,6 +1438,8 @@ platform:
       file_too_large: "Dosya boyutu ({size_mb}MB) WeCom'un 20MB sınırını aşıyor ve gönderilemiyor. Dosyayı sıkıştırmayı veya boyutunu küçültmeyi deneyin."
       voice_format_downgraded: "{content_type} ses biçimi desteklenmiyor (WeCom yalnızca AMR kabul eder); bunun yerine dosya olarak gönderildi."
       size_downgraded: "{label} boyutu ({size_mb}MB) {cap} sınırını aşıyor; bunun yerine dosya olarak gönderildi."
+      inbound_unreadable: "[An attachment arrived but could not be read: {detail}. Tell the user the file did not come through and suggest resending it another way.]"
+      inbound_unknown_reason: "unknown reason"
   email:
     image_line: "Görüntü: {url}"
     standalone_subject: "Hermes Agent"

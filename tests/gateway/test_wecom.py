@@ -1285,3 +1285,127 @@ class TestFinalFrameAckTimeoutSemantics:
                 {"msgtype": "stream", "stream": {"id": "stream_x", "content": "x", "finish": True}},
                 is_final=True,
             )
+
+
+class TestWeComInboundAttachmentNotSilentlyDropped:
+    """An inbound attachment that yields no local file must be reported, never dropped.
+
+    Regression: a `msgtype=file` callback whose media never materialized (over the old 20 MB
+    inbound cap, or a payload without a url) was skipped as an "empty" message, so the file
+    silently never reached the agent.
+    """
+
+    @staticmethod
+    def _adapter():
+        from plugins.platforms.wecom.adapter import WeComAdapter
+
+        adapter = WeComAdapter(PlatformConfig(enabled=True))
+        adapter._text_batch_delay_seconds = 0
+        adapter.handle_message = AsyncMock()
+        return adapter
+
+    @staticmethod
+    def _file_payload(msgid: str = "file-1"):
+        return {
+            "cmd": "aibot_msg_callback",
+            "headers": {"req_id": f"req-{msgid}"},
+            "body": {
+                "msgid": msgid,
+                "chattype": "single",
+                "from": {"userid": "user-1"},
+                "msgtype": "file",
+                "file": {"url": "https://cdn.example/x.zip"},
+            },
+        }
+
+    def test_has_media_ref_recognises_attachment_payloads(self):
+        from plugins.platforms.wecom.media import has_media_ref
+
+        assert has_media_ref({"msgtype": "file"}) is True
+        assert has_media_ref({"msgtype": "image"}) is True
+        assert has_media_ref({"msgtype": "text", "quote": {"msgtype": "file"}}) is True
+        assert has_media_ref({"msgtype": "text"}) is False
+
+    @pytest.mark.asyncio
+    async def test_unreadable_file_still_reaches_the_agent(self):
+        adapter = self._adapter()
+        adapter._extract_media = AsyncMock(return_value=([], []))
+        adapter._inbound_media_error = "download failed: over limit"
+
+        await adapter._on_message(self._file_payload())
+
+        adapter.handle_message.assert_awaited_once()
+        event = adapter.handle_message.await_args.args[0]
+        from gateway.platforms.event import MessageType
+
+        assert event.media_urls == []
+        assert event.message_type == MessageType.TEXT
+        assert "over limit" in event.text
+
+    @pytest.mark.asyncio
+    async def test_empty_text_message_is_still_skipped(self):
+        """Unchanged behaviour for a genuinely empty non-attachment payload."""
+        adapter = self._adapter()
+        adapter._extract_media = AsyncMock(return_value=([], []))
+        payload = self._file_payload("txt-empty")
+        payload["body"] = {"msgid": "txt-empty", "from": {"userid": "user-1"}, "msgtype": "text", "text": {"content": ""}}
+
+        await adapter._on_message(payload)
+
+        adapter.handle_message.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_inbound_cap_is_separate_from_the_send_cap(self):
+        """Inbound downloads use the 100 MB callback limit, not the 20 MB send limit."""
+        from plugins.platforms.wecom import media as wecom_media
+
+        adapter = self._adapter()
+        seen = {}
+
+        async def fake_download(url, max_bytes):
+            seen["max_bytes"] = max_bytes
+            return b"payload", {"content-type": "application/zip"}
+
+        adapter._download_remote_bytes = fake_download
+        cached = await adapter._cache_media("file", {"url": "https://cdn.example/x.zip"})
+
+        assert seen["max_bytes"] == wecom_media.INBOUND_MAX_BYTES
+        assert seen["max_bytes"] > wecom_media.FILE_MAX_BYTES
+        assert cached is not None
+
+    @pytest.mark.asyncio
+    async def test_oversize_file_end_to_end_reaches_the_agent(self):
+        """Full path: a file whose download exceeds the cap must still produce an event.
+
+        Reproduces the real incident: `msgtype=file` callback, download refused by the
+        size check, message previously skipped as empty.
+        """
+        adapter = self._adapter()
+
+        async def oversize(url, max_bytes):
+            raise ValueError(f"Remote media exceeds WeCom limit: 41943040 bytes > {max_bytes} bytes")
+
+        adapter._download_remote_bytes = oversize
+
+        await adapter._on_message(self._file_payload("file-big"))
+
+        adapter.handle_message.assert_awaited_once()
+        event = adapter.handle_message.await_args.args[0]
+        from gateway.platforms.event import MessageType
+
+        assert event.media_urls == []
+        assert event.message_type == MessageType.TEXT
+        assert "exceeds WeCom limit" in event.text
+        assert "41943040" in event.text
+
+    @pytest.mark.asyncio
+    async def test_failed_download_records_a_reason(self):
+        adapter = self._adapter()
+
+        async def boom(url, max_bytes):
+            raise ValueError("Remote media exceeds WeCom limit: 41943040 bytes")
+
+        adapter._download_remote_bytes = boom
+
+        assert await adapter._cache_media("file", {"url": "https://cdn.example/x.zip"}) is None
+        assert "exceeds WeCom limit" in adapter._inbound_media_error

@@ -35,8 +35,9 @@ from gateway.platforms.event import MessageEvent, MessageType
 from utils import env_float
 
 from gateway.platforms._shared import get_scoped_secret as _get_scoped_secret, send_error
+from agent.i18n import t
 from plugins.platforms.wecom.send_queue import ChatSendQueueMixin
-from plugins.platforms.wecom.media import WeComMediaMixin, APP_CMD_SEND
+from plugins.platforms.wecom.media import WeComMediaMixin, APP_CMD_SEND, has_media_ref
 from plugins.platforms.wecom.streaming import (
     WeComStreamMixin, ReplyQueue, StreamTurn, APP_CMD_RESPONSE,
     STREAM_NOT_SUBSCRIBED_ERRCODE, MAX_STREAM_CONTENT_LENGTH,
@@ -450,8 +451,16 @@ class WeComAdapter(WeComStreamMixin, WeComMediaMixin, ChatSendQueueMixin, OwnAcc
         if reply_text and not has_reply_context:  # quote-only message: the quote becomes the text
             text = reply_text
         if not text and not media_urls:
-            logger.info("[%s] Empty WeCom message skipped: is_group=%s chat=%s msgtype=%r", self.name, is_group, chat_id, body.get("msgtype"))
-            return
+            if not has_media_ref(body):
+                logger.info("[%s] Empty WeCom message skipped: is_group=%s chat=%s msgtype=%r", self.name, is_group, chat_id, body.get("msgtype"))
+                return
+            # The callback referenced an attachment but nothing was materialized (download refused,
+            # over the size cap, or a payload without a url). Report it as text instead of dropping
+            # the message, so the user learns the file never arrived.
+            detail = str(getattr(self, "_inbound_media_error", "") or "").strip() or t("platform.wecom.media.inbound_unknown_reason")
+            logger.warning("[%s] Inbound attachment produced no readable media (is_group=%s chat=%s msgtype=%r): %s", self.name, is_group, chat_id, body.get("msgtype"), detail)
+            text = t("platform.wecom.media.inbound_unreadable", detail=detail)
+            message_type = MessageType.TEXT
         source = self.build_source(chat_id=chat_id, chat_type="group" if is_group else "dm", user_id=sender_id or None, user_name=sender_id or None,
                                    message_id=msg_id)
         event = MessageEvent(

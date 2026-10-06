@@ -1438,6 +1438,8 @@ platform:
       file_too_large: "文件大小 {size_mb}MB 超过了企业微信允许的最大限制 20MB，无法发送。请尝试压缩文件或减小文件大小。"
       voice_format_downgraded: "语音格式 {content_type} 不支持，企微仅支持 AMR 格式，已转为文件格式发送"
       size_downgraded: "{label}大小 {size_mb}MB 超过 {cap} 限制，已转为文件格式发送"
+      inbound_unreadable: "［收到一个附件，但内容未能读取：{detail}。请告知用户文件没有收到，并建议改用其他方式重发。］"
+      inbound_unknown_reason: "未知原因"
   email:
     image_line: "图片：{url}"
     standalone_subject: "Hermes Agent"

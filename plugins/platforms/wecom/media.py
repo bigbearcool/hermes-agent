@@ -29,6 +29,10 @@ VIDEO_MAX_BYTES = 10 * 1024 * 1024
 VOICE_MAX_BYTES = 2 * 1024 * 1024
 FILE_MAX_BYTES = 20 * 1024 * 1024
 ABSOLUTE_MAX_BYTES = FILE_MAX_BYTES
+# Inbound is capped separately: WeCom's 智能机器人 callback delivers a user's file up to 100 MB
+# (developer.work.weixin.qq.com/document/path/101463), while an outbound send is limited by
+# FILE_MAX_BYTES. Reusing the send cap for inbound silently discarded every attachment above 20 MB.
+INBOUND_MAX_BYTES = 100 * 1024 * 1024
 UPLOAD_CHUNK_SIZE = 512 * 1024
 MAX_UPLOAD_CHUNKS = 100
 VOICE_SUPPORTED_MIMES = {"audio/amr"}
@@ -55,10 +59,30 @@ def _media_body(media_type: str, media_id: str) -> Dict[str, Any]:
     return {"msgtype": media_type, media_type: {"media_id": media_id}}
 
 
+def has_media_ref(body: Dict[str, Any]) -> bool:
+    """True when a callback body references an inbound attachment the adapter tries to download.
+
+    Such a reference can yield no local file (download refused, over the size cap, or a payload
+    without a url); callers use this to report the failure instead of dropping the message as empty.
+    """
+    msgtype = str(body.get("msgtype") or "").lower()
+    if msgtype in {"image", "file", "mixed"}:
+        return True
+    if msgtype == "appmsg" and isinstance(body.get("appmsg"), dict):
+        return True
+    quote = body.get("quote")
+    return isinstance(quote, dict) and str(quote.get("msgtype") or "").lower() in {"image", "file"}
+
+
 class WeComMediaMixin:
     """Media helpers mixed into WeComAdapter (uses its transport, req_id cache and stream registry)."""
 
+    # Reason the last inbound attachment produced no local file; read by the adapter so an
+    # undownloadable attachment is reported to the user instead of dropping the message as empty.
+    _inbound_media_error: str = ""
+
     async def _extract_media(self, body: Dict[str, Any]) -> Tuple[List[str], List[str]]:
+        self._inbound_media_error = ""
         refs: List[Tuple[str, Dict[str, Any]]] = []
         msgtype = str(body.get("msgtype") or "").lower()
 
@@ -92,22 +116,26 @@ class WeComMediaMixin:
             try:
                 raw = self._decode_base64(media["base64"])
             except Exception as exc:
-                logger.debug("[%s] Failed to decode %s base64 media: %s", self.name, kind, exc)
+                self._inbound_media_error = f"base64 decode failed: {exc}"
+                logger.warning("[%s] Failed to decode %s base64 media: %s", self.name, kind, exc)
                 return None
             filename = str(media.get("filename") or media.get("name") or "wecom_file")
             return await self._store_media(kind, raw, self._detect_image_ext(raw), "", filename, mimetypes.guess_type(filename)[0] or "application/octet-stream", "")
         url = str(media.get("url") or "").strip()
         if not url:
+            self._inbound_media_error = f"callback carried no download url for {kind}"
+            logger.warning("[%s] Inbound %s has no url/base64 in the callback payload: keys=%s", self.name, kind, sorted(media))
             return None
         # The key arrives URL-encoded in some payloads (%2F, %3D); base64-decode the real value.
         aes_key = unquote(str(media.get("aeskey") or "").strip())
         try:
             step = "download"
-            raw, headers = await self._download_remote_bytes(url, max_bytes=ABSOLUTE_MAX_BYTES)
+            raw, headers = await self._download_remote_bytes(url, max_bytes=INBOUND_MAX_BYTES)
             step = "decrypt"
             raw = self._decrypt_file_bytes(raw, aes_key) if aes_key else raw
         except Exception as exc:
-            logger.debug("[%s] Failed to %s %s from %s: %s", self.name, step, kind, url, exc)
+            self._inbound_media_error = f"{step} failed: {exc}"
+            logger.warning("[%s] Failed to %s inbound %s from %s: %s", self.name, step, kind, url, exc)
             return None
         content_type = str(headers.get("content-type") or "").split(";", 1)[0].strip() or "application/octet-stream"
         ext = self._guess_extension(url, content_type, fallback=self._detect_image_ext(raw))
