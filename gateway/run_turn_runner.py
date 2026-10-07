@@ -1510,7 +1510,14 @@ class TurnRunner:
                 fut = self._schedule(
                     adapter.send_exec_approval(
                         chat_id=ctx._status_chat_id, command=cmd, session_key=ctx.session_key or "",
-                        description=desc, metadata=ctx._status_thread_metadata, **flags,
+                        description=desc, metadata={
+                            **(ctx._status_thread_metadata or {}),
+                            "__hermes_approval_request_id": approval_data.get("request_id", ""),
+                            "__hermes_prompt_user_ids": tuple(value for value in (
+                                ctx.source.user_id, ctx.source.user_id_alt) if value),
+                            "__hermes_prompt_chat_type": ctx.source.chat_type,
+                        } if getattr(ctx.source.platform, "value", ctx.source.platform) == "feishu"
+                        else ctx._status_thread_metadata, **flags,
                     ),
                     "send_exec_approval scheduling error",
                 )

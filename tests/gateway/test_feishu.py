@@ -614,16 +614,16 @@ class TestFeishuAdapterMessaging(unittest.TestCase):
         self.assertEqual(card_id, "card_123")
         self.assertEqual(captured["content"].card_id, "card_123")
         self.assertEqual(captured["content"].element_id, "streaming_content")
-        self.assertEqual(captured["content"].request_body.sequence, 2)
+        self.assertEqual(captured["content"].request_body.sequence, 1)
         self.assertEqual(captured["settings"].card_id, "card_123")
-        self.assertEqual(captured["settings"].request_body.sequence, 3)
+        self.assertEqual(captured["settings"].request_body.sequence, 2)
         self.assertEqual(
             json.loads(captured["settings"].request_body.settings),
             {"config": {"streaming_mode": False}},
         )
         self.assertEqual(captured["update"].card_id, "card_123")
-        self.assertEqual(captured["update"].request_body.sequence, 4)
-        self.assertEqual(adapter._cardkit_sequences["card_123"], 4)
+        self.assertEqual(captured["update"].request_body.sequence, 3)
+        self.assertEqual(adapter._cardkit_sequences["card_123"], 3)
 
     @unittest.skipUnless(_HAS_LARK_OAPI, "lark-oapi is required for CardKit tests")
     def test_cardkit_rejected_request_does_not_advance_sequence(self):
@@ -822,59 +822,18 @@ class TestFeishuAdapterMessaging(unittest.TestCase):
             True,
         )
 
-    def test_cardkit_seq_recovery_advances_by_one_not_two(self):
-        """300317 rejection is not consumed by the server: the accepted value
-        is exactly last_committed + 1. Skipping a number (+2) reproduces
-        300317 forever and leaves the orphan card stuck in streaming mode."""
+    def test_cardkit_sequence_rejection_is_not_guessed_away(self):
         from gateway.config import PlatformConfig
         from plugins.platforms.feishu.adapter import FeishuAdapter
 
-        adapter = FeishuAdapter(
-            PlatformConfig(extra={"streaming_mode": "cardkit"})
-        )
+        adapter = FeishuAdapter(PlatformConfig(extra={"streaming_mode": "cardkit"}))
         adapter._commit_cardkit_sequence("card_123", 1)
-        adapter._update_cardkit_card = AsyncMock(
-            side_effect=[
-                RuntimeError("[300317] ErrMsg: sequence number compare failed"),
-                RuntimeError("[300317] ErrMsg: sequence number compare failed"),
-                None,
-            ]
-        )
+        adapter._update_cardkit_card = AsyncMock(side_effect=RuntimeError("[300317] rejected"))
+        with self.assertRaisesRegex(RuntimeError, "300317"):
+            asyncio.run(adapter._update_cardkit_card_with_seq_recovery("card_123", {"schema": "2.0"}))
+        self.assertEqual(adapter._update_cardkit_card.await_count, 1)
+        self.assertEqual(adapter._cardkit_sequences["card_123"], 1)
 
-        asyncio.run(
-            adapter._update_cardkit_card_with_seq_recovery(
-                "card_123", {"schema": "2.0"}
-            )
-        )
-
-        self.assertEqual(adapter._update_cardkit_card.await_count, 3)
-        # Attempted sequences: 2, then 3, then 4 — consecutive, no skips.
-        # The successful attempt (4) is committed by the real _update_cardkit_card,
-        # which is mocked out here, so the last committed value is 3.
-        self.assertEqual(adapter._cardkit_sequences["card_123"], 3)
-
-    def test_cardkit_seq_recovery_raises_after_bounded_retries(self):
-        from gateway.config import PlatformConfig
-        from plugins.platforms.feishu.adapter import FeishuAdapter
-
-        adapter = FeishuAdapter(
-            PlatformConfig(extra={"streaming_mode": "cardkit"})
-        )
-        adapter._commit_cardkit_sequence("card_123", 1)
-        adapter._update_cardkit_card = AsyncMock(
-            side_effect=RuntimeError(
-                "[300317] ErrMsg: sequence number compare failed"
-            )
-        )
-
-        with self.assertRaises(RuntimeError) as ctx:
-            asyncio.run(
-                adapter._update_cardkit_card_with_seq_recovery(
-                    "card_123", {"schema": "2.0"}
-                )
-            )
-        self.assertIn("recovery exhausted", str(ctx.exception))
-        self.assertEqual(adapter._update_cardkit_card.await_count, 5)
 
     def test_cardkit_failure_closes_orphan_and_falls_back_to_interactive_card(self):
         from gateway.config import PlatformConfig
@@ -1005,8 +964,8 @@ class TestFeishuAdapterMessaging(unittest.TestCase):
 
         self.assertTrue(result.success)
         self.assertEqual(result.message_id, "om_123")
-        self.assertNotIn("card_123", adapter._cardkit_sequences)
-        self.assertNotIn("card_123", adapter._cardkit_locks)
+        self.assertEqual(adapter._cardkit_fallback["card_123"], "om_123")
+        self.assertIn("card_123", adapter._cardkit_locks)
         adapter._close_cardkit_card_before_fallback.assert_awaited_once()
 
     def test_cardkit_edit_with_native_mention_switches_to_post(self):

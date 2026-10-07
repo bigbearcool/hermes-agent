@@ -800,6 +800,15 @@ class GatewayBusySessionMixin:
 
     async def _send_busy_ack_reply(self, event: MessageEvent, adapter, message: str) -> None:
         try:
+            # A single-card adapter may own a transient status rail. Only
+            # concrete opt-ins intercept acknowledgements; all other platforms
+            # retain their ordinary reply behavior.
+            handler = getattr(type(adapter), "send_busy_ack", None)
+            if handler is not None and await adapter.send_busy_ack(
+                event.source.chat_id, message,
+                metadata=self._thread_metadata_for_source(event.source, self._reply_anchor_for_event(event)),
+            ):
+                return
             await self._send_busy_reply(event, adapter, message)
         except Exception as e:
             logger.debug("Failed to send busy-ack: %s", e)
