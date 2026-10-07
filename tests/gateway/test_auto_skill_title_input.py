@@ -98,6 +98,9 @@ async def test_gateway_titles_original_request_without_changing_model_input(tmp_
 
     runner._run_agent_bind_turn_wiring = run_without_delivery
     runner._run_agent = runner._run_agent_inner
+    # This test bypasses handle_message's slot claim. Mirror its ownership
+    # generation now that the facade fences execution as well as delivery.
+    assert runner._begin_session_run_generation(entry.session_key) == 1
     try:
         with pytest.raises(_TurnObserved):
             await runner._handle_message_with_agent(event, source, entry.session_key, 1)

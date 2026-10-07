@@ -1036,6 +1036,7 @@ class TurnRunner:
         shape with an agent bound to a DEAD session; reusing it re-binds the dead sid and loops."""
         ctx = self._ctx
         peek_sid = None
+        entry = None
         if cache_lock and cache is not None:
             with cache_lock:
                 entry = cache.get(ctx.session_key)
@@ -1046,7 +1047,18 @@ class TurnRunner:
             # The cache is keyed by session_key, so the snapshot's row lives in that key's profile
             # store; its id is no longer in the routing index once the self-heal moved the key on.
             with suppress(Exception):
-                dead = self._runner.session_store._is_session_ended_in_db(peek_sid, session_key=ctx.session_key)
+                store = self._runner.session_store
+                dead = store._is_session_ended_in_db(peek_sid, session_key=ctx.session_key)
+                if dead and entry and getattr(entry[0], "session_id", None) == ctx.session_id:
+                    # A cache snapshot can still name the compression parent
+                    # while its agent already owns the live continuation. A
+                    # second completion in that lineage must not evict it as a
+                    # dead-session artifact. Prove the alias in the key's store.
+                    db = store._db_for_key(ctx.session_key)
+                    tip_row = db.get_session(ctx.session_id) if db is not None else None
+                    if (tip_row is not None and not tip_row.get("ended_at")
+                            and db.get_compression_tip(peek_sid) == ctx.session_id):
+                        dead = False
         return peek_sid, dead
 
     def _current_message_count(self):
@@ -1718,6 +1730,10 @@ class TurnRunner:
         try:
             api_message = _wrap_current_message_with_observed_context(self._native_image_run_message(), observed_group_context)
             kwargs = {"conversation_history": agent_history, "task_id": ctx.session_id}
+            if _accepts_keyword(agent.run_conversation, "turn_is_current"):
+                # Immutable generation fence survives cache eviction, a pending
+                # agent slot, and interrupt flags cleared by another unwind.
+                kwargs["turn_is_current"] = ctx._run_still_current
             if _accepts_keyword(agent.run_conversation, "turn_author"):
                 # Sent on every transport: a provider gating durable writes needs the bot flag in a DM too.
                 kwargs["turn_author"] = {"id": ctx.source.user_id or None, "name": ctx.source.user_name or None,

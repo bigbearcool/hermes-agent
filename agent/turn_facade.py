@@ -8,7 +8,7 @@ MRO unchanged.
 import logging
 import uuid
 from contextlib import suppress
-from typing import Any, Dict, List, Optional
+from typing import Any, Callable, Dict, List, Optional
 
 from agent.lazy_forward import forward as _forward
 
@@ -29,6 +29,7 @@ class TurnFacadeMixin:
         turn_author: Optional[Dict[str, Any]] = None,
         relay_metadata: Optional[Dict[str, Any]] = None,
         title_user_message: Optional[str]=None,
+        turn_is_current: Optional[Callable[[], bool]] = None,
     ) -> Dict[str, Any]:
         """Forwarder — see ``agent.conversation_loop.run_conversation``."""
         # A review shares this session_id for cache parity: fence review startup or interrupt
@@ -52,7 +53,9 @@ class TurnFacadeMixin:
         from agent.review_idle_queue import QUEUE as _review_queue
         from agent.subagent_lifecycle import bind_subagent_parent
         from agent.interrupt_scope import track_in_interrupt_scope
-        from agent.turn_facade_lease import admit_durable_turn_lease, carry_unadmitted_user_message
+        from agent.turn_facade_lease import (
+            admit_durable_turn_lease, carry_unadmitted_user_message, displaced_turn_result,
+        )
         from hermes_cli.observability.relay_shared_metrics import finish_task_run, start_task_run
 
         effective_task_id = task_id or str(uuid.uuid4())
@@ -82,6 +85,7 @@ class TurnFacadeMixin:
             admission = admit_durable_turn_lease(
                 self, session_id=session_id, relay_turn_id=relay_turn_id, task_context=task_context,
                 conversation_history=conversation_history,
+                turn_is_current=turn_is_current,
             )
             if admission.early_result is not None:
                 carry_unadmitted_user_message(
@@ -142,18 +146,24 @@ class TurnFacadeMixin:
             # A host that owns this thread (Hermes Console) may cancel the turn cross-thread.
             with bind_subagent_parent(self), scoped_runtime_main({}), track_in_interrupt_scope(self):
                 try:
-                    if lease is not None:
-                        lease.start()
-                    result = run_conversation(
-                        self, user_message, system_message, conversation_history, effective_task_id,
-                        stream_callback, persist_user_message,
-                        persist_user_timestamp=persist_user_timestamp,
-                        persist_user_display_kind=persist_user_display_kind,
-                        persist_user_display_metadata=persist_user_display_metadata,
-                        persist_user_platform_id=persist_user_platform_id, moa_config=moa_config,
-                        turn_author=turn_author,
-                        title_user_message=title_user_message,
-                    )
+                    # /stop or /new can invalidate an executor before its agent
+                    # is promoted into the gateway's interruptable slot. Fence
+                    # execution by the captured run generation, not resettable flags.
+                    if turn_is_current is not None and not turn_is_current():
+                        result = displaced_turn_result(conversation_history)
+                    else:
+                        if lease is not None:
+                            lease.start()
+                        result = run_conversation(
+                            self, user_message, system_message, conversation_history, effective_task_id,
+                            stream_callback, persist_user_message,
+                            persist_user_timestamp=persist_user_timestamp,
+                            persist_user_display_kind=persist_user_display_kind,
+                            persist_user_display_metadata=persist_user_display_metadata,
+                            persist_user_platform_id=persist_user_platform_id, moa_config=moa_config,
+                            turn_author=turn_author,
+                            title_user_message=title_user_message,
+                        )
                 finally:
                     # Post-loop relay/task finalization must not receive a late refresh interrupt;
                     # the interrupt clear itself waits for the thread join in the outer finally.

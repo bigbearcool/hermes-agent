@@ -32,11 +32,12 @@ class DurableTurnLease:
     written only under ``_lock``.
     """
 
-    def __init__(self, agent, db, session_id: str, holder: str) -> None:
+    def __init__(self, agent, db, session_id: str, holder: str, turn_is_current=None) -> None:
         self.agent = agent
         self.db = db
         self.session_id = session_id  # id at admission; release always targets this row
         self.holder = holder
+        self.turn_is_current = turn_is_current
         self.stop = threading.Event()
         self.refresh_interval = float(getattr(agent, "_session_turn_lease_refresh_interval", 60.0))
         self._lock = threading.Lock()
@@ -189,6 +190,10 @@ class DurableTurnLease:
         if self.stop.is_set():
             return False
         try:
+            if self.turn_is_current is not None and not self.turn_is_current():
+                self._interrupt_turn("Turn ownership revoked; stopping to protect the transcript.")
+                self.stop_refresher()
+                return False
             if self.db.refresh_session_turn_lease(
                 self._current_session_id(), self.holder, ttl_seconds=LEASE_TTL_SECONDS
             ):
@@ -237,6 +242,7 @@ def _durable_session_exists(db, session_id: str) -> Optional[bool]:
 def admit_durable_turn_lease(
     agent, *, session_id: str, relay_turn_id: str, task_context: Dict[str, Any],
     conversation_history: Optional[List[Dict[str, Any]]],
+    turn_is_current=None,
 ) -> TurnLeaseAdmission:
     """Acquire the session turn lease (the row need not exist yet); build (not start) its threads.
 
@@ -282,17 +288,28 @@ def admit_durable_turn_lease(
     if not db.acquire_session_turn_lease(
         session_id, holder, ttl_seconds=LEASE_TTL_SECONDS, wait_seconds=LEASE_WAIT_SECONDS,
         on_wait=_on_wait, on_contended=_on_contended,
-        should_abort=lambda: getattr(agent, "_interrupt_requested", False),
+        should_abort=lambda: getattr(agent, "_interrupt_requested", False)
+        or (turn_is_current is not None and not turn_is_current()),
     ):
-        admission.early_result = _lease_not_acquired_result(agent, session_id, conversation_history)
+        admission.early_result = (
+            displaced_turn_result(conversation_history)
+            if turn_is_current is not None and not turn_is_current()
+            else _lease_not_acquired_result(agent, session_id, conversation_history)
+        )
         return admission
 
     # Assign only after admission so the finally cannot release a holder that never owned the
     # row; persist paths read the agent attr so a late flush is fenced in the same transaction.
-    lease = DurableTurnLease(agent, db, session_id, holder)
+    lease = DurableTurnLease(agent, db, session_id, holder, turn_is_current=turn_is_current)
     agent._active_session_turn_lease_holder = holder
     agent._active_session_turn_lease_ttl_seconds = LEASE_TTL_SECONDS
     try:
+        # Cancellation can cross a successful SQLite acquisition. A displaced
+        # gateway worker must not clear a shared interrupt or begin a new turn.
+        if turn_is_current is not None and not turn_is_current():
+            lease.release()
+            admission.early_result = displaced_turn_result(conversation_history)
+            return admission
         # Read the row only now: the previous holder may have created or deleted it while this
         # turn waited, so an answer from before admission can be stale either way.
         durable = _durable_session_exists(db, session_id)
@@ -336,6 +353,15 @@ def admit_durable_turn_lease(
         raise
     admission.lease = lease
     return admission
+
+
+def displaced_turn_result(conversation_history) -> Dict[str, Any]:
+    """A surface revoked this turn's immutable ownership; do not mutate agent interrupts."""
+    return {
+        "final_response": "Turn cancelled before execution; ownership is no longer current.",
+        "messages": list(conversation_history or []), "api_calls": 0,
+        "completed": False, "interrupted": True, "_hard_interrupted": True,
+    }
 
 
 def carry_unadmitted_user_message(
