@@ -73,7 +73,7 @@ _LARK_SDK_IMPORTS = (
     ("lark_oapi.core", ("AccessTokenType", "HttpMethod")),
     ("lark_oapi.core.const", ("FEISHU_DOMAIN", "LARK_DOMAIN")),
     ("lark_oapi.core.model", ("BaseRequest",)),
-    ("lark_oapi.event.callback.model.p2_card_action_trigger", ("CallBackCard", "P2CardActionTriggerResponse")),
+    ("lark_oapi.event.callback.model.p2_card_action_trigger", ("CallBackCard", "CallBackToast", "P2CardActionTriggerResponse")),
     ("lark_oapi.event.dispatcher_handler", ("EventDispatcherHandler",)),
 )
 lark = FeishuWSClient = None  # type: ignore[assignment]
@@ -1441,7 +1441,10 @@ def _sdk_build(request_cls: Any, **fields: Any) -> Any:
     return builder.build()
 
 
-class FeishuAdapter(BasePlatformAdapter):
+from .clarify_cards import FeishuClarifyMixin
+
+
+class FeishuAdapter(FeishuClarifyMixin, BasePlatformAdapter):
     """Feishu/Lark bot adapter."""
     # Answers /p/<profile>/... on the default listener for a served secondary (shared_ingress).
     serves_profile_prefix: bool = True
@@ -1486,7 +1489,8 @@ class FeishuAdapter(BasePlatformAdapter):
             self._STREAMING_CARD_MODES | self._STREAMING_CARDKIT_MODES
         )
         self._live_streams: OrderedDict = OrderedDict()
-        self._cardkit_sequences: Dict[str, int] = {}
+        self._cardkit_issued_sequences: Dict[str, int] = {}  # issued/reserved, not confirmed
+        self._cardkit_confirmed_sequences: Dict[str, int] = {}
         self._cardkit_terminal: set[str] = set()
         self._cardkit_fallback: Dict[str, str] = {}
         self._cardkit_locks: Dict[str, asyncio.Lock] = {}
@@ -1513,6 +1517,8 @@ class FeishuAdapter(BasePlatformAdapter):
         self._webhook_rate_counts: Dict[str, tuple[int, float]] = {}  # rate_key → (count, window_start)
         self._webhook_anomaly_counts: Dict[str, tuple[int, str, float]] = {}  # ip → (count, last_status, first_seen)
         self._card_action_tokens: Dict[str, float] = {}  # token → first_seen_time
+        self._clarify_state: Dict[str, Dict[str, Any]] = {}
+        self._clarify_tasks: Dict[str, asyncio.Task] = {}
         self._card_action_lock = threading.RLock()
         # Inbound events that arrived before the loop was ready; one drainer thread replays them.
         self._pending_inbound_events: List[Any] = []
@@ -2105,10 +2111,15 @@ class FeishuAdapter(BasePlatformAdapter):
         Confirmed mutations and ambiguous reservations advance the local
         watermark; an explicit rejection does not prove remote consumption.
         """
-        return int(self._cardkit_sequences.get(card_id, 0) or 0) + 1
+        return int(self._cardkit_issued_sequences.get(card_id, 0) or 0) + 1
 
     def _commit_cardkit_sequence(self, card_id: str, sequence: int) -> None:
-        self._cardkit_sequences[card_id] = int(sequence)
+        self._cardkit_confirmed_sequences[card_id] = int(sequence)
+        self._reserve_cardkit_sequence(card_id, sequence)
+
+    def _reserve_cardkit_sequence(self, card_id: str, sequence: int) -> None:
+        # Issued/reserved watermark is not proof of remote acknowledgement.
+        self._cardkit_issued_sequences[card_id] = int(sequence)
         self._touch_cardkit_state(card_id)
 
     def _touch_cardkit_state(self, card_id: str) -> None:
@@ -2132,7 +2143,8 @@ class FeishuAdapter(BasePlatformAdapter):
             if stale_lock is not None and stale_lock.locked():
                 self._cardkit_state_order[stale_id] = None
                 continue
-            self._cardkit_sequences.pop(stale_id, None)
+            self._cardkit_issued_sequences.pop(stale_id, None)
+            self._cardkit_confirmed_sequences.pop(stale_id, None)
             self._cardkit_locks.pop(stale_id, None)
             self._cardkit_terminal.discard(stale_id)
             self._cardkit_fallback.pop(stale_id, None)
@@ -2148,7 +2160,8 @@ class FeishuAdapter(BasePlatformAdapter):
     def _cleanup_cardkit_state(self, card_id: str) -> None:
         self._cardkit_terminal.discard(card_id)
         self._cardkit_fallback.pop(card_id, None)
-        self._cardkit_sequences.pop(card_id, None)
+        self._cardkit_issued_sequences.pop(card_id, None)
+        self._cardkit_confirmed_sequences.pop(card_id, None)
         self._cardkit_locks.pop(card_id, None)
         self._cardkit_state_order.pop(card_id, None)
 
@@ -2188,7 +2201,7 @@ class FeishuAdapter(BasePlatformAdapter):
         # Creation has no sequence field. The first mutation starts at 1,
         # as in the content API example; no server-reserved sequence is assumed.
         card_id = str(card_id)
-        self._cardkit_sequences[card_id] = 0
+        self._cardkit_issued_sequences[card_id] = 0
         self._touch_cardkit_state(card_id)
         return card_id
 
@@ -2543,6 +2556,8 @@ class FeishuAdapter(BasePlatformAdapter):
             self._ws_supervisor = None
         await self._cancel_pending_tasks(self._pending_text_batch_tasks)
         await self._cancel_pending_tasks(self._pending_media_batch_tasks)
+        await self._cancel_pending_tasks(self._clarify_tasks)
+        self._clarify_state.clear()
         self._reset_batch_buffers()
         # ``_disable_websocket_auto_reconnect()`` nils ``_ws_client`` — capture first.
         # Send a WebSocket CLOSE frame to Feishu BEFORE tearing down the thread loop. Without this, Feishu's
@@ -2614,7 +2629,8 @@ class FeishuAdapter(BasePlatformAdapter):
         self._loop = None
         self._event_handler = None
         self._shutdown_sdk_executor()
-        self._cardkit_sequences.clear()
+        self._cardkit_issued_sequences.clear()
+        self._cardkit_confirmed_sequences.clear()
         self._cardkit_locks.clear()
         self._cardkit_state_order.clear()
         self._persist_seen_message_ids()
@@ -2658,11 +2674,20 @@ class FeishuAdapter(BasePlatformAdapter):
     # --- Outbound — send / edit / send_image / send_voice / … ---
     @staticmethod
     def _stream_key(chat_id: str, metadata: Optional[Dict[str, Any]]) -> tuple:
-        return chat_id, str((metadata or {}).get("thread_id") or "")
+        meta = metadata or {}
+        base = (chat_id, str(meta.get("thread_id") or ""))
+        if not meta.get("gateway_session_key"):
+            return base
+        return (*base, str(meta["gateway_session_key"]), str(meta.get("gateway_turn_id") or ""))
 
     async def send_busy_ack(self, chat_id: str, content: str, *, metadata=None) -> bool:
         """Transient acknowledgement: finalization replaces it inside the live card."""
         key = self._stream_key(chat_id, metadata)
+        if len(key) == 4 and not key[3]:
+            # Busy input belongs to the active turn of its gateway session, not
+            # the new inbound message. Never fall back to another user's card.
+            key = next((candidate for candidate in reversed(self._live_streams)
+                        if candidate[:3] == key[:3]), key)
         live = self._live_streams.get(key)
         if live is None:
             return False
@@ -2688,8 +2713,15 @@ class FeishuAdapter(BasePlatformAdapter):
         self, chat_id: str, content: str, reply_to: Optional[str] = None,
         metadata: Optional[Dict[str, Any]] = None,
     ) -> SendResult:
+        from .cardkit_mutations import await_settled
+        # Settlement includes creation, reference send, and local registration.
+        # Shielding individual HTTP waits is insufficient: they re-raise before
+        # the caller can record the remotely committed identity.
+        return await await_settled(self._send_and_register(chat_id, content, reply_to, metadata))
+
+    async def _send_and_register(self, chat_id, content, reply_to, metadata):
         result = await self._send_message(chat_id, content, reply_to, metadata)
-        if result.success and result.message_id and self.supports_single_streaming_message(metadata) and (
+        if result.message_id and self.supports_single_streaming_message(metadata) and (
             isinstance(metadata, dict) and metadata.get(self._STREAMING_METADATA_KEY) is True
         ):
             key = self._stream_key(chat_id, metadata)
@@ -2759,6 +2791,10 @@ class FeishuAdapter(BasePlatformAdapter):
                                     initial_content,
                                 )
                             except Exception as exc:
+                                from .cardkit_mutations import cancellation_requested
+                                if cancellation_requested():
+                                    return SendResult(success=False, message_id=result.message_id,
+                                                      error=f"CardKit initial update cancelled: {exc}")
                                 logger.warning(
                                     "[Feishu] CardKit initial content stream failed; "
                                     "replacing the reference message with a compatible card: %s",
@@ -2800,6 +2836,10 @@ class FeishuAdapter(BasePlatformAdapter):
                         return result
                     raise RuntimeError(result.error or "cardkit message send failed")
                 except Exception as exc:
+                    from .cardkit_mutations import cancellation_requested
+                    if cancellation_requested():
+                        return SendResult(success=False, message_id=im_message_id,
+                                          error=f"CardKit delivery cancelled: {exc}")
                     if im_message_id:
                         # A visible reference already exists. Never send another
                         # message when patching that reference fails.
@@ -2903,6 +2943,11 @@ class FeishuAdapter(BasePlatformAdapter):
                 metadata = {**(metadata or {}), self._STREAMING_METADATA_KEY: True}
             result = await self._edit_message(chat_id, message_id, content, finalize=finalize, metadata=metadata)
             key = self._stream_key(chat_id, metadata)
+            targets = {original_id, message_id, result.message_id}
+            if key not in self._live_streams:
+                # Reconciliation callers may only possess the IM/card identity.
+                key = next((candidate for candidate, value in self._live_streams.items()
+                            if candidate[0] == chat_id and value[0] in targets), key)
             live = self._live_streams.get(key)
             if result.success:
                 if finalize:
@@ -3549,6 +3594,8 @@ class FeishuAdapter(BasePlatformAdapter):
         action = getattr(event, "action", None)
         action_value = getattr(action, "value", {}) or {}
         if isinstance(action_value, dict):
+            if action_value.get("hermes_clarify_action"):
+                return self._handle_clarify_card_action(event, action_value)
             if action_value.get("hermes_action"):
                 return self._handle_approval_card_action(event=event, action_value=action_value, loop=loop)
             if action_value.get("hermes_update_prompt_action"):
@@ -3584,11 +3631,13 @@ class FeishuAdapter(BasePlatformAdapter):
         return "*" in allowed_ids or normalized in allowed_ids
 
     @staticmethod
-    def _card_response(card_data: Optional[Dict[str, Any]] = None) -> Any:
+    def _card_response(card_data: Optional[Dict[str, Any]] = None, *, toast_message: Optional[str] = None) -> Any:
         """Synchronous card-callback response; ``card_data`` updates the card inline."""
         if P2CardActionTriggerResponse is None:
             return None
         response = P2CardActionTriggerResponse()
+        if toast_message is not None and CallBackToast is not None:
+            response.toast = CallBackToast({"type": "info", "content": toast_message})
         if card_data is not None and CallBackCard is not None:
             card = CallBackCard()
             card.type = "raw"
@@ -3666,7 +3715,8 @@ class FeishuAdapter(BasePlatformAdapter):
         if not self._submit_on_loop(loop, coro):
             state.pop("claimed", None)
             return self._card_response()
-        return self._card_response(self._build_resolved_approval_card(choice=choice, user_name=user_name))
+        # A toast cannot overwrite a terminal PATCH if the transport ACK is late.
+        return self._card_response(toast_message=f"处理中，请等待实际审批结果。操作人：{user_name}")
 
     def _handle_update_prompt_card_action(self, *, event: Any, action_value: Dict[str, Any], loop: Any) -> Any:
         """Schedule update prompt resolution and build the synchronous callback response."""
@@ -3726,6 +3776,15 @@ class FeishuAdapter(BasePlatformAdapter):
         if not state:
             return
         try:
+            processing = _card("审批处理中", "blue", f"处理中，请等待实际审批结果。\n操作人：{user_name}")
+            request = self._build_patch_message_request(message_id=state["message_id"],
+                request_body=self._build_patch_message_body(content=json.dumps(processing, ensure_ascii=False)))
+            response = await self._run_blocking(self._client.im.v1.message.patch, request)
+            if not self._response_succeeded(response):
+                logger.warning("[Feishu] Approval processing patch failed")
+        except Exception:
+            logger.warning("[Feishu] Approval processing patch failed", exc_info=True)
+        try:
             from tools.approval import resolve_gateway_approval
             request_id = state.get("request_id")
             count = resolve_gateway_approval(state["session_key"], choice, **({"request_id": request_id} if request_id else {}))
@@ -3733,21 +3792,19 @@ class FeishuAdapter(BasePlatformAdapter):
                 "Feishu button resolved %d approval(s) for session %s (choice=%s, user=%s)",
                 count, state["session_key"], choice, user_name,
             )
-            if not count and choice != "deny":
-                # The card already reads "Approved" (synchronous callback), but nothing was
-                # waiting — the wait timed out (fail-closed deny) or was resolved via /approve.
-                # Correct the record so the user doesn't believe the command ran.
-                _chat = str(state.get("chat_id", "") or chat_id or "")
-                if _chat:
-                    try:
-                        await self.send(
-                            _chat,
-                            t("platform.shared.approval_expired"),
-                        )
-                    except Exception:
-                        logger.debug("[Feishu] expired-approval notice failed", exc_info=True)
+            card = (self._build_resolved_approval_card(choice=choice, user_name=user_name)
+                    if count else _card("审批已失效", "grey", t("platform.shared.approval_expired")))
         except Exception as exc:
             logger.error("Failed to resolve gateway approval from Feishu button: %s", exc)
+            card = _card("审批失败", "red", "审批未成功，请重新发起请求。")
+        try:
+            request = self._build_patch_message_request(message_id=state["message_id"],
+                request_body=self._build_patch_message_body(content=json.dumps(card, ensure_ascii=False)))
+            response = await self._run_blocking(self._client.im.v1.message.patch, request)
+            if not self._response_succeeded(response):
+                logger.warning("[Feishu] Approval result same-card patch failed: %s", getattr(response, "msg", "unknown"))
+        except Exception:
+            logger.warning("[Feishu] Approval result same-card patch failed", exc_info=True)
 
     async def _resolve_update_prompt(
         self, prompt_id: Any, answer: str, user_name: str, *, open_id: str = "", chat_id: str = "",
@@ -3825,7 +3882,8 @@ class FeishuAdapter(BasePlatformAdapter):
     async def _handle_card_action_event(self, data: Any) -> None:
         """Route Feishu interactive card button clicks as synthetic COMMAND events."""
         event = getattr(data, "event", None)
-        token = str(getattr(event, "token", "") or "")
+        token = str(getattr(getattr(data, "header", None), "event_id", "") or
+                    getattr(event, "token", "") or "")
         if token and self._is_card_action_duplicate(token):
             logger.debug("[Feishu] Dropping duplicate card action token: %s", token)
             return
@@ -4247,6 +4305,11 @@ class FeishuAdapter(BasePlatformAdapter):
         self._clear_webhook_anomaly(remote_ip)
 
         event_type = str((payload.get("header") or {}).get("event_type") or "")
+        if event_type == "card.action.trigger":
+            # Authentication is already checked above. SDK decoding preserves
+            # action.value/form_value as mappings (namespace conversion does not).
+            response = self._build_event_handler()._do_without_validation(body_bytes)
+            return web.json_response(json.loads(lark.JSON.marshal(response)) if response is not None else {})
         data = self._namespace_from_mapping(payload)
         if event_type in {"im.message.reaction.created_v1", "im.message.reaction.deleted_v1"}:
             self._on_reaction_event(event_type, data)
@@ -5322,7 +5385,10 @@ class FeishuAdapter(BasePlatformAdapter):
                 chat_id=chat_id, msg_type=msg_type, payload=payload, reply_to=reply_target, metadata=retry_metadata,
             )
 
+        from .cardkit_mutations import cancellation_requested
         for attempt in range(_FEISHU_SEND_ATTEMPTS):
+            if attempt and cancellation_requested():
+                raise last_error or RuntimeError("Feishu send cancelled during retry backoff")
             try:
                 response = await _raw(active_reply_to)
                 # Reply target withdrawn/missing → post a new message to the chat instead.
@@ -5348,7 +5414,7 @@ class FeishuAdapter(BasePlatformAdapter):
                 last_error = exc
                 if msg_type == "post" and _POST_CONTENT_INVALID_RE.search(str(exc)):
                     raise
-                if attempt >= _FEISHU_SEND_ATTEMPTS - 1:
+                if attempt >= _FEISHU_SEND_ATTEMPTS - 1 or cancellation_requested():
                     raise
                 wait_seconds = 2 ** attempt
                 logger.warning(

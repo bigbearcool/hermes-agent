@@ -324,11 +324,9 @@ class TestCardActionCallbackResponse:
             response = adapter._on_card_action_trigger(data)
 
         assert response is not None
-        assert response.card is not None
-        assert response.card.type == "raw"
-        card = response.card.data
-        assert t("platform.feishu.approval.resolved_once") in card["header"]["title"]["content"]
-        assert "Bob" in card["elements"][0]["content"]
+        assert response.card is None
+        assert "处理中" in response.toast.content
+        assert "Bob" in response.toast.content
 
 
     def test_ignores_expired_cached_name(self, _patch_callback_card_types):
@@ -350,9 +348,9 @@ class TestCardActionCallbackResponse:
         with patch("asyncio.run_coroutine_threadsafe", side_effect=_close_submitted_coro):
             response = adapter._on_card_action_trigger(data)
 
-        card = response.card.data
-        assert "Old Name" not in card["elements"][0]["content"]
-        assert "ou_expired" in card["elements"][0]["content"]
+        assert response.card is None
+        assert "Old Name" not in response.toast.content
+        assert "ou_expired" in response.toast.content
 
     def test_rejects_approval_click_from_unauthorized_user(self, _patch_callback_card_types):
         adapter = _make_adapter()
@@ -499,8 +497,8 @@ class TestCardActionCallbackResponse:
             response = adapter._on_card_action_trigger(data)
 
         assert response is not None
-        assert response.card is not None
-        assert t("platform.feishu.approval.resolved_once") in response.card.data["header"]["title"]["content"]
+        assert response.card is None
+        assert "处理中" in response.toast.content
 
     def test_paired_mode_participant_can_confirm_update_prompt(self, _patch_callback_card_types):
         """Empty allowlist (DM paired mode): the prompt recipient can still confirm."""

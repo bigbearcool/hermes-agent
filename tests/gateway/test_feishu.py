@@ -623,7 +623,7 @@ class TestFeishuAdapterMessaging(unittest.TestCase):
         )
         self.assertEqual(captured["update"].card_id, "card_123")
         self.assertEqual(captured["update"].request_body.sequence, 3)
-        self.assertEqual(adapter._cardkit_sequences["card_123"], 3)
+        self.assertEqual(adapter._cardkit_issued_sequences["card_123"], 3)
 
     @unittest.skipUnless(_HAS_LARK_OAPI, "lark-oapi is required for CardKit tests")
     def test_cardkit_rejected_request_does_not_advance_sequence(self):
@@ -652,7 +652,7 @@ class TestFeishuAdapterMessaging(unittest.TestCase):
                 )
             )
         )
-        adapter._cardkit_sequences["card_123"] = 7
+        adapter._cardkit_issued_sequences["card_123"] = 7
 
         with self.assertRaisesRegex(RuntimeError, "300309"):
             asyncio.run(
@@ -663,7 +663,7 @@ class TestFeishuAdapterMessaging(unittest.TestCase):
             )
 
         self.assertEqual(captured["sequence"], 8)
-        self.assertEqual(adapter._cardkit_sequences["card_123"], 7)
+        self.assertEqual(adapter._cardkit_issued_sequences["card_123"], 7)
 
     @unittest.skipUnless(_HAS_LARK_OAPI, "lark-oapi is required for CardKit tests")
     def test_cardkit_timeout_recovery_reuses_rejected_sequence_then_continues(self):
@@ -700,7 +700,7 @@ class TestFeishuAdapterMessaging(unittest.TestCase):
                 )
             )
         )
-        adapter._cardkit_sequences["card_123"] = 7
+        adapter._cardkit_issued_sequences["card_123"] = 7
 
         asyncio.run(
             adapter._stream_cardkit_content_with_recovery(
@@ -711,7 +711,7 @@ class TestFeishuAdapterMessaging(unittest.TestCase):
 
         self.assertEqual(content_sequences, [8, 9])
         self.assertEqual(settings_sequences, [8])
-        self.assertEqual(adapter._cardkit_sequences["card_123"], 9)
+        self.assertEqual(adapter._cardkit_issued_sequences["card_123"], 9)
 
     @unittest.skipUnless(_HAS_LARK_OAPI, "lark-oapi is required for CardKit tests")
     def test_cardkit_finalize_reconcile_continues_confirmed_sequence(self):
@@ -736,7 +736,7 @@ class TestFeishuAdapterMessaging(unittest.TestCase):
                 )
             )
         )
-        adapter._cardkit_sequences["card_123"] = 7
+        adapter._cardkit_issued_sequences["card_123"] = 7
 
         async def _finalize_twice():
             for content in ("预览最终答案", "完整最终答案"):
@@ -751,7 +751,7 @@ class TestFeishuAdapterMessaging(unittest.TestCase):
         asyncio.run(_finalize_twice())
 
         self.assertEqual(sequences, [8, 9])
-        self.assertEqual(adapter._cardkit_sequences["card_123"], 9)
+        self.assertEqual(adapter._cardkit_issued_sequences["card_123"], 9)
 
     def test_cardkit_finalize_updates_card_and_retains_state_for_reconcile(self):
         from gateway.config import PlatformConfig
@@ -763,7 +763,7 @@ class TestFeishuAdapterMessaging(unittest.TestCase):
         adapter._client = SimpleNamespace(cardkit=SimpleNamespace())
         adapter._set_cardkit_streaming_mode = AsyncMock()
         adapter._update_cardkit_card = AsyncMock()
-        adapter._cardkit_sequences["card_123"] = 4
+        adapter._cardkit_issued_sequences["card_123"] = 4
         adapter._cardkit_locks["card_123"] = asyncio.Lock()
 
         result = asyncio.run(
@@ -791,7 +791,7 @@ class TestFeishuAdapterMessaging(unittest.TestCase):
         self.assertIn("✅ read_file (0.2s)", final_payload)
         self.assertIn("工具调用记录（1）", final_payload)
         self.assertIn("🔧 1 tools", final_payload)
-        self.assertEqual(adapter._cardkit_sequences["card_123"], 4)
+        self.assertEqual(adapter._cardkit_issued_sequences["card_123"], 4)
         self.assertIn("card_123", adapter._cardkit_locks)
 
     def test_cardkit_stream_timeout_reopens_and_retries_without_false_failure(self):
@@ -832,7 +832,7 @@ class TestFeishuAdapterMessaging(unittest.TestCase):
         with self.assertRaisesRegex(RuntimeError, "300317"):
             asyncio.run(adapter._update_cardkit_card_with_seq_recovery("card_123", {"schema": "2.0"}))
         self.assertEqual(adapter._update_cardkit_card.await_count, 1)
-        self.assertEqual(adapter._cardkit_sequences["card_123"], 1)
+        self.assertEqual(adapter._cardkit_issued_sequences["card_123"], 1)
 
 
     def test_cardkit_failure_closes_orphan_and_falls_back_to_interactive_card(self):
@@ -877,7 +877,7 @@ class TestFeishuAdapterMessaging(unittest.TestCase):
         adapter = FeishuAdapter(
             PlatformConfig(extra={"streaming_mode": "cardkit"})
         )
-        adapter._cardkit_sequences["card_123"] = 2
+        adapter._cardkit_issued_sequences["card_123"] = 2
         adapter._cardkit_locks["card_123"] = asyncio.Lock()
         adapter._set_cardkit_streaming_mode = AsyncMock(
             side_effect=RuntimeError("settings failed")
@@ -891,7 +891,7 @@ class TestFeishuAdapterMessaging(unittest.TestCase):
             )
         )
 
-        self.assertNotIn("card_123", adapter._cardkit_sequences)
+        self.assertNotIn("card_123", adapter._cardkit_issued_sequences)
         self.assertNotIn("card_123", adapter._cardkit_locks)
         adapter._update_cardkit_card.assert_awaited_once()
         adapter._set_cardkit_streaming_mode.assert_not_awaited()
@@ -903,7 +903,7 @@ class TestFeishuAdapterMessaging(unittest.TestCase):
         adapter = FeishuAdapter(
             PlatformConfig(extra={"streaming_mode": "cardkit"})
         )
-        adapter._cardkit_sequences["card_123"] = 2
+        adapter._cardkit_issued_sequences["card_123"] = 2
         adapter._update_cardkit_card = AsyncMock(
             side_effect=RuntimeError("update failed")
         )
@@ -921,7 +921,7 @@ class TestFeishuAdapterMessaging(unittest.TestCase):
             "card_123",
             False,
         )
-        self.assertNotIn("card_123", adapter._cardkit_sequences)
+        self.assertNotIn("card_123", adapter._cardkit_issued_sequences)
 
     def test_cardkit_edit_failure_releases_state_after_in_place_fallback(self):
         from gateway.config import PlatformConfig
@@ -939,7 +939,7 @@ class TestFeishuAdapterMessaging(unittest.TestCase):
                 )
             ),
         )
-        adapter._cardkit_sequences["card_123"] = 3
+        adapter._cardkit_issued_sequences["card_123"] = 3
         adapter._cardkit_locks["card_123"] = asyncio.Lock()
         adapter._stream_cardkit_content_with_recovery = AsyncMock(
             side_effect=RuntimeError("content rejected")
@@ -984,7 +984,7 @@ class TestFeishuAdapterMessaging(unittest.TestCase):
                 )
             ),
         )
-        adapter._cardkit_sequences["card_123"] = 3
+        adapter._cardkit_issued_sequences["card_123"] = 3
         adapter._cardkit_locks["card_123"] = asyncio.Lock()
         adapter._close_cardkit_card_before_fallback = AsyncMock()
         adapter._run_blocking = AsyncMock(
@@ -1014,7 +1014,7 @@ class TestFeishuAdapterMessaging(unittest.TestCase):
             payload["zh_cn"]["content"][0][0],
             {"tag": "at", "user_id": "ou_peer_bot"},
         )
-        self.assertNotIn("card_123", adapter._cardkit_sequences)
+        self.assertNotIn("card_123", adapter._cardkit_issued_sequences)
         self.assertNotIn("card_123", adapter._cardkit_locks)
 
     def test_a2a_channel_prompt_documents_native_mention_contract(self):
@@ -1213,11 +1213,11 @@ def test_delete_cardkit_preview_uses_im_id_and_retains_state_until_ack(delete_su
     assert result is delete_success
     assert [request.message_id for request in requests] == ["om_preview"]
     if delete_success:
-        assert "card_preview" not in adapter._cardkit_sequences
+        assert "card_preview" not in adapter._cardkit_issued_sequences
         assert "card_preview" not in adapter._cardkit_locks
         assert "card_preview" not in adapter._cardkit_state_order
     else:
-        assert adapter._cardkit_sequences["card_preview"] == 4
+        assert adapter._cardkit_issued_sequences["card_preview"] == 4
         assert adapter._cardkit_locks["card_preview"] is card_lock
         assert "card_preview" in adapter._cardkit_state_order
 

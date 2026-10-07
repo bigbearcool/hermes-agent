@@ -8,6 +8,14 @@ https://open.feishu.cn/document/cardkit-v1/card/update
 import asyncio
 import json
 import logging
+from contextvars import ContextVar
+
+_cancellation_requested: ContextVar[asyncio.Event | None] = ContextVar('feishu_settlement_cancellation', default=None)
+
+
+def cancellation_requested():
+    signal = _cancellation_requested.get()
+    return signal is not None and signal.is_set()
 
 logger = logging.getLogger(__name__)
 
@@ -19,6 +27,11 @@ def _ambiguous(exc):
 
 async def await_settled(awaitable):
     """Delay cancellation until an uncancellable SDK worker actually exits."""
+    signal = _cancellation_requested.get()
+    token = None
+    if signal is None:
+        signal = asyncio.Event()
+        token = _cancellation_requested.set(signal)
     worker = asyncio.ensure_future(awaitable)
     cancelled = False
     while not worker.done():
@@ -26,11 +39,14 @@ async def await_settled(awaitable):
             await asyncio.shield(worker)
         except asyncio.CancelledError:
             cancelled = True
+            signal.set()
         except Exception:
             break
     try:
         return worker.result()  # retrieve failures even when the caller was cancelled
     finally:
+        if token is not None:
+            _cancellation_requested.reset(token)
         if cancelled:
             raise asyncio.CancelledError()
 
@@ -47,8 +63,8 @@ async def mutate(adapter, card_id, function, request, error_message):
                     raise
                 # Reserve this sequence even if all retries fail. A later *different*
                 # operation must be newer, whether this operation committed or not.
-                adapter._commit_cardkit_sequence(card_id, sequence)
-                if attempt == 2:
+                adapter._reserve_cardkit_sequence(card_id, sequence)
+                if attempt == 2 or cancellation_requested():
                     raise
                 logger.warning("[Feishu] Ambiguous CardKit mutation; replaying identical UUID/sequence for %s", card_id)
                 continue

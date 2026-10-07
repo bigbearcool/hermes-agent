@@ -16,7 +16,7 @@ worker because ``sys.path`` is still polluted.
 
 Use :func:`load_plugin_adapter` instead of ad-hoc ``sys.path`` tricks.
 It loads the adapter from an explicit file path under a unique module
-name (``plugin_adapter_<plugin_name>``), so it cannot collide with any
+name (``plugin_adapter_<plugin_name>_pkg.adapter``), so it cannot collide with any
 other plugin's adapter module.
 
 The ``tests/gateway/conftest.py`` guard rejects the anti-pattern at
@@ -40,11 +40,12 @@ def load_plugin_adapter(plugin_name: str) -> ModuleType:
     """Import ``plugins/platforms/<plugin_name>/adapter.py`` in isolation.
 
     The module is registered under the unique name
-    ``plugin_adapter_<plugin_name>`` in ``sys.modules``. No ``sys.path``
+    ``plugin_adapter_<plugin_name>_pkg.adapter`` in ``sys.modules``. No ``sys.path``
     mutation. Safe to call multiple times — repeat calls return the
     already-loaded module.
     """
-    module_name = f"plugin_adapter_{plugin_name}"
+    package_name = f"plugin_adapter_{plugin_name}_pkg"
+    module_name = f"{package_name}.adapter"
     cached = sys.modules.get(module_name)
     if cached is not None:
         return cached
@@ -56,6 +57,11 @@ def load_plugin_adapter(plugin_name: str) -> ModuleType:
             f"Known plugins: {sorted(p.name for p in _PLUGINS_DIR.iterdir() if p.is_dir())}"
         )
 
+    # Match the production loader's package context so topical siblings can
+    # use relative imports without leaking onto sys.path.
+    package = ModuleType(package_name)
+    package.__path__ = [str(adapter_path.parent)]
+    sys.modules.setdefault(package_name, package)
     spec = importlib.util.spec_from_file_location(module_name, adapter_path)
     if spec is None or spec.loader is None:
         raise ImportError(f"Could not build import spec for {adapter_path}")

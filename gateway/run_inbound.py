@@ -418,6 +418,12 @@ class GatewayInboundMixin:
             return None
         if _pending_clarify is None:
             return None
+        _clarify_adapter = self._delivery_adapter_for(source)
+        _answer_gate = getattr(type(_clarify_adapter), "can_answer_clarify", None)
+        if _answer_gate is not None and not _clarify_adapter.can_answer_clarify(_pending_clarify.clarify_id, source):
+            logger.info("Gateway ignored non-owner clarify text (session=%s, id=%s)",
+                        _quick_key, _pending_clarify.clarify_id)
+            return ""
         _clarify_has_audio = bool(self._pending_event_audio_paths(event))
         _raw_clarify_reply = await self._prepare_clarify_reply_text(event)
 

@@ -806,7 +806,8 @@ class GatewayBusySessionMixin:
             handler = getattr(type(adapter), "send_busy_ack", None)
             if handler is not None and await adapter.send_busy_ack(
                 event.source.chat_id, message,
-                metadata=self._thread_metadata_for_source(event.source, self._reply_anchor_for_event(event)),
+                metadata={**(self._thread_metadata_for_source(event.source, self._reply_anchor_for_event(event)) or {}),
+                          "gateway_session_key": self._session_key_for_source(event.source)},
             ):
                 return
             await self._send_busy_reply(event, adapter, message)

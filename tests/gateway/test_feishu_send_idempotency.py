@@ -54,5 +54,6 @@ def test_failed_initial_compatibility_patch_does_not_create_another_card():
         assert not result.success
         assert result.message_id == 'im'
         assert adapter._feishu_send_with_retry.await_count == 1
+        assert list(adapter._live_streams.values())[0][0] == 'im'
     finally:
         adapter._get_sdk_executor().shutdown(wait=True)

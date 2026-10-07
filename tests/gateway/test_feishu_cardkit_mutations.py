@@ -34,7 +34,7 @@ def test_ambiguous_mutation_replays_identical_request(operation):
         assert len(seen) == 2
         assert seen[0] is seen[1]
         assert seen[0].request_body.uuid == seen[1].request_body.uuid
-        assert adapter._cardkit_sequences["card"] == seen[-1].request_body.sequence
+        assert adapter._cardkit_issued_sequences["card"] == seen[-1].request_body.sequence
     finally:
         adapter._get_sdk_executor().shutdown(wait=True)
 

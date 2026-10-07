@@ -50,5 +50,6 @@ def test_sdk_ws_event_frame_returns_one_inline_resolution(monkeypatch):
     first_response = json.loads(first.payload)
     replay_response = json.loads(replay.payload)
     assert first_response['code'] == 200
-    assert 'card' in json.loads(base64.b64decode(first_response['data']))
-    assert 'card' not in json.loads(base64.b64decode(replay_response['data']))
+    assert 'toast' in json.loads(base64.b64decode(first_response['data']))
+    assert 'toast' not in json.loads(base64.b64decode(replay_response['data']))
+    assert 'card' not in json.loads(base64.b64decode(first_response['data']))

@@ -4212,6 +4212,14 @@ class GatewayTurnMixin:
         turn_ctx._event_callback_sync = turn_runner._event_callback_sync
         turn_ctx._status_callback_sync = turn_runner._status_callback_sync
         turn_ctx._status_adapter = self._delivery_adapter_for(source)
+        if getattr(type(turn_ctx._status_adapter), "send_busy_ack", None) is not None:
+            # Optional native rail surface: bind the real gateway lane rather
+            # than allowing a transport to infer it from a shared chat id.
+            import uuid
+            _status_thread_metadata = {**(_status_thread_metadata or {}),
+                "gateway_session_key": turn_ctx.session_key,
+                "gateway_turn_id": getattr(turn_ctx, "inbound_message_id", None) or event_message_id or uuid.uuid4().hex,
+                "user_id": source.user_id}
         turn_ctx._status_chat_id = source.chat_id
         turn_ctx._status_thread_metadata = _status_thread_metadata
         return _status_thread_metadata

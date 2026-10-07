@@ -35,7 +35,7 @@ def test_sdk_replays_empty_committed_response_without_new_identity():
         asyncio.run(adapter._stream_cardkit_content_with_recovery('123', 'full snapshot'))
         assert len(bodies) == 2
         assert bodies[0] == bodies[1]
-        assert adapter._cardkit_sequences['123'] == bodies[0]['sequence']
+        assert adapter._cardkit_issued_sequences['123'] == bodies[0]['sequence']
     finally:
         adapter._get_sdk_executor().shutdown(wait=True)
         server.shutdown()
