@@ -1666,6 +1666,18 @@ class SendResult:
     error_kind: Optional[str] = None
 
 
+class SendCancelledError(asyncio.CancelledError):
+    """A cancelled send that settled remotely; retain its result for cleanup.
+
+    Adapters with uncancellable I/O may opt in. This is still cancellation,
+    not a successful return: callers must re-raise after recording identity.
+    """
+
+    def __init__(self, result: SendResult):
+        super().__init__()
+        self.result = result
+
+
 # Longest server ``retry_after`` ``_send_with_retry`` will sleep inline. Longer penalties return the
 # typed failure so the delivery ledger owns the wait (#91969: a 97-minute FloodWait slept verbatim
 # pinned the send coroutine and froze inbound on every platform).

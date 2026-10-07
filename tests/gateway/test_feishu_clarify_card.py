@@ -55,7 +55,7 @@ def test_clarify_callback_rejects_foreign_or_retired_binding(bad):
     entry = cg.register('cid','session','q',['one'])
     adapter._clarify_state['cid'] = {'session_key':'session','chat_id':'chat','message_id':'im',
         'created_at':time.time(),'owner_ids':('owner',),'entry':entry}
-    if bad == 'expiry': adapter._clarify_state['cid']['created_at'] = 0
+    if bad == 'expiry': assert cg.wait_for_response('cid', .001) is None
     if bad == 'request': cg.clear_session('session'); cg.register('cid','session','new q',['one'])
     payload = {'schema':'2.0','header':{'event_id':'event','event_type':'card.action.trigger'},
         'event':{'operator':{'open_id':'intruder' if bad == 'user' else 'owner'},
@@ -66,8 +66,42 @@ def test_clarify_callback_rejects_foreign_or_retired_binding(bad):
         response = adapter._build_event_handler()._do_without_validation(json.dumps(payload).encode())
         assert response.card is None
         pending = cg.get_pending_for_session('session',include_choice_prompts=True)
-        assert not pending.event.is_set()
+        if bad == 'expiry':
+            assert pending is None
+        else:
+            assert pending is not None and not pending.event.is_set()
     finally: cg.clear_session('session')
+
+
+@pytest.mark.parametrize('timeout', [3600, 0])
+def test_live_clarify_waiter_accepts_owner_after_dedup_ttl(timeout):
+    import threading
+    import time
+    assert module._load_lark_oapi()
+    adapter = module.FeishuAdapter(PlatformConfig())
+    adapter._loop = SimpleNamespace(is_closed=lambda: False)
+    entry = cg.register('late', 'session', 'q', ['one'])
+    adapter._clarify_state['late'] = {'session_key': 'session', 'chat_id': 'chat',
+        'message_id': 'im', 'created_at': time.time() - 901,
+        'owner_ids': ('owner',), 'entry': entry}
+    answers = []
+    waiter = threading.Thread(target=lambda: answers.append(cg.wait_for_response('late', timeout)))
+    waiter.start()
+    payload = {'schema': '2.0', 'header': {'event_id': 'late-event', 'event_type': 'card.action.trigger'},
+        'event': {'operator': {'open_id': 'owner'},
+            'context': {'open_chat_id': 'chat', 'open_message_id': 'im'},
+            'action': {'value': {'hermes_clarify_action': 'submit', 'clarify_id': 'late'},
+                'form_value': {'selection': '0'}}}}
+    try:
+        response = adapter._build_event_handler()._do_without_validation(json.dumps(payload).encode())
+        assert entry.event.is_set(), 'A live waiter must not expire at the replay-cache TTL'
+        waiter.join(2)
+        assert not waiter.is_alive()
+        assert answers == ['one']
+        assert response.card is not None
+    finally:
+        cg.clear_session('session')
+        waiter.join(2)
 
 
 def test_missing_owner_does_not_publish_an_unbound_native_prompt():

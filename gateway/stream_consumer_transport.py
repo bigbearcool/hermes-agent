@@ -12,6 +12,7 @@ import time
 from typing import Any, Optional
 
 from gateway.platforms.base import BasePlatformAdapter as _BasePlatformAdapter
+from gateway.platforms.base import SendCancelledError
 from gateway.stream_consumer_fences import ensure_closed_code_fences
 from hermes_cli.observability.shared_metrics_gateway import stops_reply_clock
 
@@ -460,14 +461,24 @@ class StreamTransportMixin:
                 "declined this destination for this run"
             )
             return False
-        result = await self.adapter.send(
-            chat_id=self.chat_id, content=text, reply_to=self._initial_reply_to_id,
-            metadata=self._metadata_for_send(final=finalize, expect_edits=not finalize))
-        if not result.success:
+        try:
+            result = await self.adapter.send(
+                chat_id=self.chat_id, content=text, reply_to=self._initial_reply_to_id,
+                metadata=self._metadata_for_send(final=finalize, expect_edits=not finalize))
+        except SendCancelledError as exc:
+            # The transport settled despite cancellation. Record the committed
+            # identity before run() performs its existing cancel/finalize cleanup.
+            self._record_first_send_result(exc.result, text, committed_partial=True)
+            raise
+        return self._record_first_send_result(result, text)
+
+    def _record_first_send_result(self, result, text: str, *, committed_partial=False) -> bool:
+        """Adopt a settled send without treating it as turn-final delivery."""
+        if not result.success and not (committed_partial and result.message_id):
             self._edit_supported = False
             return False
         self._already_sent = True
-        self._last_sent_text = text
+        self._last_sent_text = text if result.success else ""
         if result.message_id:
             self._adopt_message_id(result.message_id)
             self._track_preview_ids_from_result(result)

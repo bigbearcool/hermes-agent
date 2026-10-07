@@ -13,6 +13,7 @@ def test_first_send_cancel_preserves_reconcilable_identity(cancel_at):
     assert module._load_lark_oapi()
     entered, release = threading.Event(), threading.Event()
     operations = []
+    bodies = []
     class Handler(BaseHTTPRequestHandler):
         def do_POST(self):
             operations.append(self.path)
@@ -26,7 +27,7 @@ def test_first_send_cancel_preserves_reconcilable_identity(cancel_at):
                 {'card_id':'card'} if phase == 'create' else {'message_id':'im'}}).encode())
         def do_PUT(self):
             operations.append(self.path)
-            self.rfile.read(int(self.headers['Content-Length']))
+            bodies.append(json.loads(self.rfile.read(int(self.headers['Content-Length']))))
             fail_initial = cancel_at == 'initial' and len(operations) == 3
             if fail_initial:
                 entered.set(); assert release.wait(5)
@@ -47,18 +48,41 @@ def test_first_send_cancel_preserves_reconcilable_identity(cancel_at):
         setattr(obj, name, lambda req, original=original: original(req, option))
     adapter = module.FeishuAdapter(PlatformConfig(extra={'streaming_mode':'cardkit'})); adapter._client = sdk
     async def run():
-        task = asyncio.create_task(adapter.send('chat','draft',metadata={'__hermes_streaming':True}))
+        from gateway.stream_consumer import GatewayStreamConsumer, StreamConsumerConfig
+        consumer = GatewayStreamConsumer(adapter, 'chat', StreamConsumerConfig(
+            edit_interval=.01, buffer_threshold=1, cursor=''))
+        task = asyncio.create_task(consumer.run())
+        consumer.on_delta('draft')
         assert await asyncio.to_thread(entered.wait, 5)
         task.cancel(); release.set()
-        with pytest.raises(asyncio.CancelledError): await task
-        assert len(operations) == 3  # no retry or compatibility I/O after cancellation
-        live = list(adapter._live_streams.values())
-        assert len(live) == 1
-        assert live[0][0] == 'cardkit:card:im'
-        result = await adapter.edit_message('chat', live[0][0], 'cancelled', finalize=True)
-        assert result.success
+        await task  # the real run() handler must adopt identity and finalize it
+        assert consumer.message_id == 'cardkit:card:im'
+        assert consumer.final_content_delivered
+        assert consumer.delivered_final_matches('draft') is True
         assert 'card' in adapter._cardkit_terminal
         assert not adapter._live_streams
+        assert sum('/im/' in path for path in operations) == 1
+        assert sum(path == '/open-apis/cardkit/v1/cards/card' for path in operations) == 1
+        from types import SimpleNamespace as NS
+        from gateway.run_turn import GatewayTurnMixin
+        response = {'final_response': 'draft'}
+        turn_ctx = NS(stream_consumer_holder=[consumer], source=NS(chat_id='chat'), session_key='session')
+        await GatewayTurnMixin()._run_agent_mark_streamed_delivery(response, turn_ctx)
+        assert response['already_sent'] is True
+        response = {'final_response': 'reconciled final'}
+        await GatewayTurnMixin()._run_agent_mark_streamed_delivery(response, turn_ctx)
+        assert response['already_sent'] is True
+        assert 'reconciled final' in json.dumps(bodies[-1])
+        # The actual queued reconciliation lane must also edit the adopted ID,
+        # rather than send a second reference and overwrite the old live entry.
+        from gateway.run import GatewayRunner
+        runner = object.__new__(GatewayRunner)
+        await runner._deliver_queued_first_response('complete final', source=turn_ctx.source,
+            adapter=adapter, metadata=None, text_already_delivered=False,
+            deliver_media=False, stream_consumer=consumer)
+        assert sum('/im/' in path for path in operations) == 1
+        assert not adapter._live_streams
+        assert 'complete final' in json.dumps(bodies[-1])
     try: asyncio.run(run())
     finally:
         release.set(); adapter._get_sdk_executor().shutdown(wait=True)

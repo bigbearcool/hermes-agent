@@ -2717,7 +2717,10 @@ class FeishuAdapter(FeishuClarifyMixin, BasePlatformAdapter):
         # Settlement includes creation, reference send, and local registration.
         # Shielding individual HTTP waits is insufficient: they re-raise before
         # the caller can record the remotely committed identity.
-        return await await_settled(self._send_and_register(chat_id, content, reply_to, metadata))
+        from gateway.platforms.base import SendCancelledError
+        return await await_settled(
+            self._send_and_register(chat_id, content, reply_to, metadata),
+            cancelled_error_factory=SendCancelledError)
 
     async def _send_and_register(self, chat_id, content, reply_to, metadata):
         result = await self._send_message(chat_id, content, reply_to, metadata)
@@ -3654,7 +3657,10 @@ class FeishuAdapter(FeishuClarifyMixin, BasePlatformAdapter):
         """
         if state.get("claimed"):
             return None
-        if "created_at" in state and time.time() - state["created_at"] > _FEISHU_CARD_ACTION_DEDUP_TTL_SECONDS:
+        # Clarify validity is the bound gateway waiter's lifetime (checked by
+        # _handle_clarify_card_action), including unlimited waits. The callback
+        # replay-cache TTL must not silently expire a still-live prompt.
+        if label != "clarify" and "created_at" in state and time.time() - state["created_at"] > _FEISHU_CARD_ACTION_DEDUP_TTL_SECONDS:
             return None
         context = getattr(event, "context", None)
         if "created_at" in state and (

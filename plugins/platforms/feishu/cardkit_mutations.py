@@ -25,7 +25,7 @@ def _ambiguous(exc):
     return isinstance(exc, (TimeoutError, json.JSONDecodeError, RequestException))
 
 
-async def await_settled(awaitable):
+async def await_settled(awaitable, *, cancelled_error_factory=None):
     """Delay cancellation until an uncancellable SDK worker actually exits."""
     signal = _cancellation_requested.get()
     token = None
@@ -42,12 +42,16 @@ async def await_settled(awaitable):
             signal.set()
         except Exception:
             break
+    result = None
     try:
-        return worker.result()  # retrieve failures even when the caller was cancelled
+        result = worker.result()  # retrieve failures even when the caller was cancelled
+        return result
     finally:
         if token is not None:
             _cancellation_requested.reset(token)
         if cancelled:
+            if cancelled_error_factory is not None and result is not None:
+                raise cancelled_error_factory(result)
             raise asyncio.CancelledError()
 
 
