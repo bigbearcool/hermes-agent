@@ -232,6 +232,12 @@ class GatewayNotificationsMixin:
                 target_session_id, "unknown" if tip_row is None else "ended",
             )
             return None
+        tip_source = tip_row.get("created_source") or tip_row.get("source")
+        tip_key = tip_row.get("session_key")
+        if ((tip_source and tip_source != getattr(session_entry.platform, "value", None))
+                or (tip_key and tip_key != session_entry.session_key)):
+            logger.warning("Compression completion target is not the gateway owner; dropping injection.")
+            return None
         route_owns_lineage = session_entry.session_id in {pinned_session_id, target_session_id}
         if not route_owns_lineage:
             # Across several rotations, accept a stale route only when its own tip is the same live target.
@@ -281,6 +287,37 @@ class GatewayNotificationsMixin:
             pinned_row = await session_db.get_session(pinned_session_id)
         except Exception:
             logger.debug("Async-delegation parent lookup failed for %s", pinned_session_id, exc_info=True)
+        # A terminal watcher can carry the spawning subagent's durable ID.
+        # That ID owns an executing child lease, never the reply-facing route.
+        # Follow only explicit parent links; unknown/cyclic ownership stays closed.
+        child_owner = False
+        visited = set()
+        while pinned_row is not None and (
+            pinned_row.get("created_source") or pinned_row.get("source")
+        ) == "subagent":
+            child_owner = True
+            if pinned_session_id in visited or len(visited) >= 64:
+                logger.warning("Cyclic or excessive child completion ancestry; dropping injection.")
+                return None
+            visited.add(pinned_session_id)
+            parent_id = pinned_row.get("parent_session_id")
+            if not parent_id:
+                return None
+            pinned_session_id = parent_id
+            try:
+                pinned_row = await session_db.get_session(parent_id)
+            except Exception:
+                logger.warning("Child completion owner lookup failed; dropping injection.", exc_info=True)
+                return None
+        if pinned_row is not None:
+            source = pinned_row.get("created_source") or pinned_row.get("source")
+            platform = getattr(session_entry.platform, "value", None)
+            owner_key = pinned_row.get("session_key")
+            if ((source and source != platform)
+                    or (owner_key and owner_key != session_entry.session_key)
+                    or (child_owner and owner_key != session_entry.session_key)):
+                logger.warning("Child/async completion does not own this gateway route; dropping injection.")
+                return None
         if pinned_row is None:
             logger.warning(
                 "Async-delegation completion has unknown spawning session %s; "
